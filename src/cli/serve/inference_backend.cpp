@@ -2650,8 +2650,7 @@ public:
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens),
-        distributed_(model_->TpWorldSize() > 1) {
+        max_draft_tokens_(max_draft_tokens) {
     // The typed in-process API owns an immutable loaded model but need not
     // supply file fingerprints when disk caching is disabled. Its model
     // lifetime is an exact process-local identity; durable caches still
@@ -2666,14 +2665,6 @@ public:
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
       component_identity_ = persistence_->compatibility_identity;
-      if (distributed_) {
-        // A TP rank's snapshot holds only its half of the split state.
-        const std::string rank =
-            "tp_rank=" + std::to_string(model_->TpRank()) +
-            "\ntp_world_size=" + std::to_string(model_->TpWorldSize()) + "\n";
-        auto& identity = persistence_->compatibility_identity;
-        identity.insert(identity.end(), rank.begin(), rank.end());
-      }
     } else {
       std::ostringstream identity;
       identity << "schema=gufo-process-text-continuation-v1\n"
@@ -3253,19 +3244,10 @@ public:
 
   [[nodiscard]] std::optional<std::uint32_t> PlanDecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
-    if (decodes.size() < 2 || !use_mtp_) {
-      return std::nullopt;
-    }
-    std::vector<QwenFlashNextSession::DecodeRequest> requests;
-    requests.reserve(decodes.size());
-    for (const auto& decode : decodes) {
-      requests.push_back(
-          {&RequireQwenFlashNextState(decode.state.get()).session(),
-           std::min<std::size_t>(decode.max_tokens,
-                                 std::uint64_t{max_draft_tokens_} + 1),
-           &decode.sampler.get(), nullptr});
-    }
-    return QwenFlashNextSession::PlanBatch(requests);
+    // The upstream Qwen3.8-Flash-Next session carries no rank-symmetric
+    // batch planner; the TP2 batch plan is MiMo2-only in this port.
+    (void)decodes;
+    return std::nullopt;
   }
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatchPlanned(
@@ -3302,7 +3284,8 @@ public:
            &sampler, &results[i], state.stop_at_eos(), &outcomes[i]});
     }
     std::string error;
-    (void)QwenFlashNextSession::DecodeBatch(requests, &error, plan);
+    (void)QwenFlashNextSession::DecodeBatch(requests, &error);
+    (void)plan;
     const auto active_count = static_cast<std::size_t>(std::count_if(
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
@@ -5299,10 +5282,6 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
-            .tp_rank = tp_config.rank,
-            .tp_world_size = tp_config.world_size,
-            .hip_device = tp_config.hip_device,
-            .communicator = tp_config.communicator,
         },
         &load_error);
     if (model == nullptr) {
@@ -5713,13 +5692,6 @@ bool InferenceBackend::load(
   if (max_context == 0)
     max_context = model->MaxContext();
 
-  if (model->TpWorldSize() > 1 &&
-      (tp_config.control == nullptr || tp_config.communicator == nullptr)) {
-    SetError(error,
-             "Qwen3.8-Flash-Next TP2 requires a worker control channel "
-             "and communicator");
-    return false;
-  }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
     return false;
@@ -5760,8 +5732,8 @@ bool InferenceBackend::load(
              "invalid");
     return false;
   }
-  const auto tp_world_size = model->TpWorldSize();
-  const auto tp_rank = model->TpRank();
+  const auto tp_world_size = std::uint32_t{1};  // upstream qwen38 is TP-free
+  const auto tp_rank = std::uint32_t{0};
   const bool has_mtp = model->HasMtp();
   const bool has_vision = model->VisionEncoder() != nullptr;
   try {
@@ -5820,7 +5792,7 @@ bool InferenceBackend::load(
                 ? disk_cache_config.staging_capacity_bytes
                 : std::min(
                       disk_cache_config.capacity_bytes,
-                      TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes);
+                      std::size_t{1} * 1024U * 1024U * 1024U);
         disk = std::make_shared<TpDiskStore>(
             TpDiskStore::Options{
                 .directory = disk_cache_config.directory,
@@ -6026,7 +5998,7 @@ bool InferenceBackend::load(std::shared_ptr<models::mimo2::Model> model,
                 ? disk_cache_config.staging_capacity_bytes
                 : std::min(
                       disk_cache_config.capacity_bytes,
-                      TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes);
+                      std::size_t{1} * 1024U * 1024U * 1024U);
         disk = std::make_shared<TpDiskStore>(
             TpDiskStore::Options{
                 .directory = disk_cache_config.directory,

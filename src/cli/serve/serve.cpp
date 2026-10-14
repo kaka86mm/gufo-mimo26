@@ -1519,8 +1519,6 @@ int RunServe(std::span<const char* const> args) {
         .hip_device = static_cast<int>(tp_device),
         .auth_token = tp_control_token,
     };
-    std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>
-        tp_communicator;
     std::shared_ptr<models::mimo2::rocm::Communicator> tp_mimo2_communicator;
     std::shared_ptr<server::TpControlChannel> tp_control;
     if (tp_world_size == 2 && tp_rank == 1) {
@@ -1535,19 +1533,6 @@ int RunServe(std::span<const char* const> args) {
     }
     if (tp_world_size == 2) {
 #ifdef GUFO_ENABLE_TP2_RDMA
-      const models::qwen38_flash_next::rocm::IbrverbsConfig rdma_config{
-          .rank = tp_rank,
-          .world_size = tp_world_size,
-          .bootstrap_host = tp_bootstrap_host,
-          .bootstrap_port = static_cast<std::uint16_t>(tp_bootstrap_port),
-          .device_index = tp_device,
-          .rdma_device = tp_rdma_device,
-          .rdma_port = tp_rdma_port,
-          .gid_index = tp_gid_index < 0
-                           ? std::nullopt
-                           : std::optional<std::uint32_t>(
-                                 static_cast<std::uint32_t>(tp_gid_index)),
-      };
       std::string tp_error;
       // A MiMo TP2 pair builds the mimo2 transport directly: it carries the
       // graph-capture exchange protocol the executor-wide decode graphs
@@ -1586,16 +1571,11 @@ int RunServe(std::span<const char* const> args) {
         server::Logger::Info(
             "tp", "event=rdma_ready " + tp_mimo2_communicator->Describe());
       } else {
-        tp_communicator =
-            models::qwen38_flash_next::rocm::CreateIbrverbsCommunicator(
-                rdma_config, &tp_error);
-        if (!tp_communicator) {
-          std::cerr << "Error creating TP2 RDMA communicator: " << tp_error
-                    << '\n';
-          return 1;
-        }
-        server::Logger::Info("tp",
-                             "event=rdma_ready " + tp_communicator->Describe());
+        // Upstream Qwen3.8-Flash-Next carries no TP accessors in this port:
+        // the RDMA transport is wired for MiMo2 only.
+        std::cerr << "Error: --tp-world-size 2 with TP2 RDMA is supported for "
+                     "MiMo2 models only\n";
+        return 1;
       }
       tp_control =
           tp_rank == 0
@@ -1614,7 +1594,6 @@ int RunServe(std::span<const char* const> args) {
       return 2;
 #endif
     }
-    tp_config.communicator = tp_communicator;
     tp_config.mimo2_communicator = tp_mimo2_communicator;
     tp_config.control = tp_control;
     std::string err;

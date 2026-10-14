@@ -50,8 +50,6 @@ public:
                hipMemcpyKind kind = hipMemcpyDeviceToHost) {
     Check(hipMemcpyAsync(destination, source, bytes, kind, stream_));
   }
-  void Finish() { Check(hipStreamSynchronize(stream_)); }
-
   void Copy2D(void* destination, std::size_t destination_pitch,
               const void* source, std::size_t source_pitch, std::size_t width,
               std::size_t height, hipMemcpyKind kind = hipMemcpyDeviceToHost) {
