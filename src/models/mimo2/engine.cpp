@@ -408,7 +408,10 @@ bool Session::MtpEnabled() const noexcept {
 /// plain decoding. The verdict already means no width repays its cycle; the
 /// latch then also drops the predictor catch-up those cycles pay, which the
 /// policy alone cannot (it must stay in sync in case drafting resumes).
-/// GUFO_MTP_LATCH_CTX overrides the default; 0 disables the latch.
+/// GUFO_MTP_LATCH_CTX overrides the default. There is no off switch: a small
+/// value (0) makes the latch eligible from the first token, and disabling it
+/// means a value no request can reach (2026-10-14 window: 0 measured as plain
+/// decoding, not as drafting everywhere).
 static std::uint32_t MtpLatchContext() {
   static const std::uint32_t context = [] {
     const char* env = getenv("GUFO_MTP_LATCH_CTX");
