@@ -183,6 +183,9 @@ std::size_t QuantizedRowBytes(core::GgmlType type,
     case core::GgmlType::kQ8_1:
       block_bytes = 36;
       break;
+    case core::GgmlType::kMXFP4:
+      block_bytes = 17;
+      break;
     case core::GgmlType::kQ2_K:
       block_bytes = 84;
       break;
@@ -599,6 +602,34 @@ float Iq3sValue(const block_iq3_s& block, std::size_t index) noexcept {
 
 const std::uint32_t* Iq3sGrid() noexcept {
   return kIq3sGrid;
+}
+
+void DequantizeMXFP4(const void* src, float* dst, std::size_t k) {
+  // kvalues_mxfp4 holds doubled E2M1 magnitudes (see the GPU tables), so the
+  // decode halves them here to stay bit-identical to the vecdot kernels.
+  static constexpr std::int8_t kValuesMxfp4[16] = {
+      0, 1, 2, 3, 4, 6, 8, 12, 0, -1, -2, -3, -4, -6, -8, -12};
+  const auto* bytes = static_cast<const unsigned char*>(src);
+  const std::size_t nb = k / 32;
+  for (std::size_t b = 0; b < nb; ++b) {
+    const unsigned char* blk = bytes + b * 17;
+    float scale;
+    const unsigned int e = blk[0];
+    if (e == 0) {
+      scale = 5.8774717541114375e-39F;  // 2^-127
+    } else {
+      std::uint32_t bits = static_cast<std::uint32_t>(e) << 23;
+      std::memcpy(&scale, &bits, sizeof(scale));
+    }
+    const float half_scale = 0.5F * scale;
+    for (std::size_t i = 0; i < 16; ++i) {
+      const unsigned char pair = blk[1 + i];
+      dst[(b * 32) + 2 * i] =
+          half_scale * static_cast<float>(kValuesMxfp4[pair & 0x0F]);
+      dst[(b * 32) + 2 * i + 1] =
+          half_scale * static_cast<float>(kValuesMxfp4[pair >> 4]);
+    }
+  }
 }
 
 void DequantizeIQ4_NL(const void* src, float* dst, std::size_t k) {

@@ -93,6 +93,16 @@ struct ContinuationCache::Impl {
   [[nodiscard]] bool snapshot_mode() const noexcept {
     return static_cast<bool>(snapshot_support.restore);
   }
+  [[nodiscard]] bool StateReusable(const ContinuationState& state) const {
+    return !snapshot_support.state_reusable ||
+           snapshot_support.state_reusable(state);
+  }
+  [[nodiscard]] bool SnapshotReusable(
+      const std::shared_ptr<const ContinuationSnapshot>& snapshot) const {
+    return snapshot != nullptr &&
+           (!snapshot_support.snapshot_reusable ||
+            snapshot_support.snapshot_reusable(*snapshot));
+  }
 
   // Rank extra copies before the last useful checkpoint of a prefix family.
   // Exact tokens and input identity, not client IDs or hashes, establish that
@@ -410,7 +420,7 @@ bool ContinuationCache::Lease::HasSnapshotFor(
     return false;
   const std::lock_guard lock(cache_->impl_->mutex);
   return std::ranges::any_of(cache_->impl_->entries, [&](const auto& source) {
-    return source->valid && source->snapshot &&
+    return source->valid && cache_->impl_->SnapshotReusable(source->snapshot) &&
            std::ranges::equal(source->input_identity,
                               InputIdentity(tokens.size())) &&
            std::ranges::equal(source->tokens, tokens);
@@ -478,7 +488,7 @@ ContinuationCache::Lease ContinuationCache::Acquire(
     const bool has_fallback =
         stable_prefix_tokens == 0 ||
         std::ranges::any_of(impl_->entries, [&](const auto& entry) {
-          return entry->valid && entry->snapshot &&
+          return entry->valid && impl_->SnapshotReusable(entry->snapshot) &&
                  (entry->tokens.size() <= stable_prefix_tokens ||
                   (entry->stable_prefix_tokens != 0 &&
                    entry->stable_prefix_tokens <= stable_prefix_tokens)) &&
@@ -505,6 +515,10 @@ ContinuationCache::Lease ContinuationCache::Acquire(
         skip_reason = "stable_prefix_boundary";
       else if (!IsPrefix(entry.tokens, prompt))
         skip_reason = "token_prefix";
+      else if (!(impl_->snapshot_mode()
+                     ? impl_->SnapshotReusable(entry.snapshot)
+                     : impl_->StateReusable(*entry.state)))
+        skip_reason = "state_rejected";
       if (!skip_reason.empty()) {
         if (debug_cache) {
           skipped.push_back({index, entry.tokens.size(), skip_reason});
@@ -526,7 +540,8 @@ ContinuationCache::Lease ContinuationCache::Acquire(
             entry.live_tokens.size() >= cached_tokens &&
             can_reuse(entry.live_tokens.size()) &&
             matches_input(entry.live_identity, entry.live_tokens.size()) &&
-            IsPrefix(entry.live_tokens, prompt)) {
+            IsPrefix(entry.live_tokens, prompt) &&
+            impl_->StateReusable(*entry.state)) {
           live_source = index;
           cached_tokens = entry.live_tokens.size();
         }
@@ -702,6 +717,32 @@ ContinuationCache::Lease ContinuationCache::Acquire(
   }
 }
 
+void ContinuationCache::Clear() {
+  const std::lock_guard<std::mutex> lock(impl_->mutex);
+  // Snapshot-only checkpoint entries are never available and hold no lease.
+  if (impl_->reserved_snapshot_bytes != 0 ||
+      std::ranges::any_of(impl_->entries, [](const auto& entry) {
+        return entry->state != nullptr && !entry->available;
+      })) {
+    throw std::logic_error(
+        "cannot clear a continuation cache with active leases");
+  }
+  for (auto& entry : impl_->entries) {
+    entry->snapshot.reset();
+    entry->snapshot_bytes = 0;
+    entry->stable_prefix_tokens = 0;
+    entry->tokens.clear();
+    entry->input_identity.clear();
+    entry->live_tokens.clear();
+    entry->live_identity.clear();
+    entry->valid = false;
+    entry->dirty = false;
+    if (entry->state)
+      entry->state->Invalidate();
+  }
+  impl_->retained_snapshot_bytes = 0;
+}
+
 std::size_t ContinuationCache::CachedPrefixTokens(
     std::span<const ContinuationToken> prompt,
     std::span<const std::uint8_t> input_identity,
@@ -719,9 +760,12 @@ std::size_t ContinuationCache::CachedPrefixTokens(
   for (const auto& entry : impl_->entries) {
     if (entry->valid && (impl_->snapshot_mode() || entry->available) &&
         entry->tokens.size() > longest &&
+        (!impl_->snapshot_mode() ||
+         impl_->SnapshotReusable(entry->snapshot)) &&
         matches(entry->tokens, entry->input_identity))
       longest = entry->tokens.size();
     if (impl_->snapshot_mode() && entry->available &&
+        entry->state != nullptr && impl_->StateReusable(*entry->state) &&
         entry->live_tokens.size() > longest &&
         matches(entry->live_tokens, entry->live_identity))
       longest = entry->live_tokens.size();
@@ -748,10 +792,12 @@ std::size_t ContinuationCache::CommonPrefixTokens(
   const std::lock_guard<std::mutex> lock(impl_->mutex);
   std::size_t longest = 0;
   for (const auto& entry : impl_->entries) {
-    if (entry->valid)
+    if (entry->valid && (!impl_->snapshot_mode() ||
+                         impl_->SnapshotReusable(entry->snapshot)))
       longest = std::max(longest, common(entry->tokens, entry->input_identity));
-    longest =
-        std::max(longest, common(entry->live_tokens, entry->live_identity));
+    if (entry->state != nullptr && impl_->StateReusable(*entry->state))
+      longest =
+          std::max(longest, common(entry->live_tokens, entry->live_identity));
   }
   return longest;
 }

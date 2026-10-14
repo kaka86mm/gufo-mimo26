@@ -22,15 +22,26 @@ namespace gufo::models::deepseek_v4_flash {
 class Model;
 }
 
+namespace gufo::models::mimo2 {
+class Model;
+namespace rocm {
+class Communicator;
+}  // namespace rocm
+}  // namespace gufo::models::mimo2
+
 namespace gufo::models::qwen38_flash_next {
 class Model;
+namespace rocm {
+class Communicator;
 }
+}  // namespace gufo::models::qwen38_flash_next
 
 namespace gufo::tokenization {
 class QwenTokenizer;
 }
 
 namespace gufo::server {
+class TpControlChannel;
 
 enum class TextSpeculativeBackend : std::uint8_t {
   kDisabled,
@@ -46,6 +57,19 @@ struct TextSpeculativeConfig {
   std::uint32_t min_draft_tokens{1};
   speculative::DFlashDraftPolicy dflash_policy{
       speculative::DFlashDraftPolicy::kAdaptive};
+};
+
+struct TextTpConfig {
+  std::uint32_t rank{0};
+  std::uint32_t world_size{1};
+  int hip_device{0};
+  std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
+  /// The mimo2 transport, when the serve CLI built it directly: it carries
+  /// the graph-capture exchange protocol (see serve.cpp). Null on every
+  /// other model or a single-rank run.
+  std::shared_ptr<models::mimo2::rocm::Communicator> mimo2_communicator;
+  std::shared_ptr<TpControlChannel> control;
+  std::string auth_token;
 };
 
 struct TextDiskCacheConfig {
@@ -81,6 +105,7 @@ public:
             const TextSpeculativeConfig& speculative_config = {},
             const TextDiskCacheConfig& disk_cache_config = {},
             const std::string& vision_model_path = {},
+            const TextTpConfig& tp_config = {},
             TextRunnerRamCacheOptions ram_cache_config = {});
 
 #if defined(ENGINE_ENABLE_HIP)
@@ -113,8 +138,27 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
+            const TextTpConfig& tp_config = {},
             TextRunnerRamCacheOptions ram_cache_config = {});
+
+  /// Installs a previously loaded MiMo-V2 model with request-owned sessions,
+  /// the model's tokenizer, and host-memory continuation snapshots.
+  bool load(std::shared_ptr<models::mimo2::Model> model, std::string* error,
+            std::uint32_t max_context = 0, std::size_t session_count = 1,
+            TextPrefillPolicy prefill_policy = {},
+            TextSchedulerPolicy scheduler_policy = {},
+            TextSpeculativeConfig speculative_config = {},
+            TextDiskCacheConfig disk_cache_config = {},
+            const TextTpConfig& tp_config = {});
+
+  /// Runs the rank-1 TP2 worker loop until the control channel closes.
+  [[nodiscard]] bool run_worker(std::string* error);
 #endif
+
+  /// Rank 0 of a TP2 pair: why the pair broke (rank 1 or the link was lost),
+  /// or empty. Once it did, every later request fails and the server is not
+  /// ready.
+  [[nodiscard]] std::string tp_failure() const;
 
   /// Stable model identifier used in API responses.
   [[nodiscard]] std::string model_id() const override;

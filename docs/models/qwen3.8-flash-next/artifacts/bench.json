@@ -60,6 +60,15 @@
         131072
       ],
       "context": 133760,
+      "tp2_depths": [
+        0,
+        4096,
+        32768,
+        65536,
+        131072,
+        258048
+      ],
+      "tp2_context": 262144,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",
@@ -86,6 +95,15 @@
         131072
       ],
       "context": 133760,
+      "tp2_depths": [
+        0,
+        4096,
+        32768,
+        65536,
+        131072,
+        258048
+      ],
+      "tp2_context": 262144,
       "depth_tolerance": 0.005,
       "prefix": {
         "generator": "synthetic-paragraphs",

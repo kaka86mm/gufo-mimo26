@@ -461,11 +461,16 @@ def render_document(config: BenchConfig, document: str, only: set[str] | None = 
     known = {t.id: t for t in config.tables()}
     rendered: list[str] = []
 
+    from .tp2 import TABLES as TP2_TABLES, render_table as render_tp2
+
     def replace(match: re.Match[str]) -> str:
         table_id = match.group("id")
-        if table_id not in known or (only and table_id not in only):
+        if (table_id not in known and table_id not in TP2_TABLES) or (only and table_id not in only):
             return match.group(0)
-        body = render_table(config, known[table_id], existing.get(table_id))
+        if table_id in TP2_TABLES:
+            body = render_tp2(config, table_id)
+        else:
+            body = render_table(config, known[table_id], existing.get(table_id))
         rendered.append(table_id)
         return f"<!-- bench:{table_id} -->\n{body}<!-- /bench -->"
 

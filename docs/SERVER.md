@@ -971,6 +971,12 @@ token to populate the cache. A failed model operation invalidates its mutable
 state; the prompt snapshot remains available for safe replay. Image identity,
 positions and speculative state participate in restoration and cache isolation.
 
+Qwen3.8 Flash-Next can be served by two hosts over RDMA (InfiniBand, RoCE v2
+or USB4): rank 0
+runs this server and rank 1 executes the same model calls on its half of the
+weights. It needs the optional `GUFO_ENABLE_TP2_RDMA` build; see
+[TP2](models/qwen3.8-flash-next/TP2.md).
+
 `GET /health` reports process liveness. `GET /ready` returns 503 until a model
 service is ready, then reports `status` and the active model. Both read the
 recorded device state without performing GPU work on each poll. HTTP model replacement and persistent Responses

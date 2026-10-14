@@ -1,0 +1,52 @@
+# User unit for the rank 1 (worker) host of a two-host gufo TP=2 server.
+#
+# The instance name is the quantization (q4, q8, ...). Started by the rank 0
+# host's gufo@.service, which first hands this host's user manager every
+# setting (systemctl --user set-environment GUFO_HEAD_HOST=... GUFO_MODEL=...),
+# and writes a new TP control token into this host's runtime directory
+# (%t/gufo.token, a tmpfs), so this host needs nothing but this unit.
+# Started any other way, it refuses to run. Without a reachable rank 0 host
+# the worker exits and restarts until one appears.
+#
+# The container runs in the foreground ("podman run --rm", no -d): systemd
+# owns the process and the restart policy, and the container output is
+# tagged with this unit in the journal.
+[Unit]
+Description=Gufo TP=2 two-host LLM server worker, rank 1 %i
+# A failing start check repeats three times at most per minute.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+Restart=on-failure
+RestartSec=5
+# gufo exits with 2 on invalid options, which a restart does not fix
+RestartPreventExitStatus=2
+TimeoutStopSec=5min
+SyslogIdentifier=gufo-rank1
+ExecStartPre=/bin/sh -c '[ -n "$GUFO_HEAD_HOST" ] && [ -n "$GUFO_MODEL" ] && [ -s %t/gufo.token ] || \
+  { echo "no settings from the rank 0 host: start gufo@%i there" >&2; exit 1; }; \
+  [ -z "$GUFO_TP_RDMA_DEVICE" ] || [ -e "/sys/class/infiniband/$GUFO_TP_RDMA_DEVICE" ] || \
+    { echo "no RDMA device $GUFO_TP_RDMA_DEVICE (is its driver loaded?)" >&2; exit 1; }'
+ExecStartPre=/bin/sh -c 'cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
+  mkdir -p "$cache/gufo-tp2/%i" "$cache/gufo"'
+ExecStart=/bin/sh -c 'dir=$${GUFO_MODEL_DIR:-/opt/models}; checkout=$${GUFO_CHECKOUT:-$HOME/git/gufo}; cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
+  exec podman run --rm --log-driver none --security-opt label=disable \
+  --userns keep-id:uid=1000,gid=1000 \
+  --device /dev/kfd --device /dev/dri \
+  --device /dev/infiniband $${GUFO_RDMA_DRIVERS:+-v "$${GUFO_RDMA_DRIVERS%%/*}:$${GUFO_RDMA_DRIVERS%%/*}:ro" -e RDMAV_DRIVERS=$GUFO_RDMA_DRIVERS} \
+  --group-add keep-groups --ulimit memlock=-1 --network host \
+  -v "$checkout:/workspace/gufo:ro" -v "$dir:$dir:ro" \
+  -v "$cache/gufo-tp2/%i:/cache" \
+  -v "$cache/gufo:/xdg-cache/gufo" -e XDG_CACHE_HOME=/xdg-cache \
+  -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
+  --model "$dir/$GUFO_MODEL" \
+  --speculative mtp --mtp-model "$dir/$GUFO_MODEL_MTP" \
+  --draft-tokens 7 \
+  --cache-disk /cache --cache-disk-bytes "$${GUFO_CACHE_DISK_BYTES:-68719476736}" \
+  --sessions $GUFO_SESSIONS --max-pending $GUFO_MAX_PENDING \
+  --tp-world-size 2 --tp-rank 1 --tp-bootstrap-host $GUFO_HEAD_HOST \
+  --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  $${GUFO_TP_RDMA_DEVICE:+--tp-rdma-device $GUFO_TP_RDMA_DEVICE} \
+  --tp-control-token "$(cat %t/gufo.token)"'

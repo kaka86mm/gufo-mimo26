@@ -192,6 +192,8 @@ std::size_t QwenDFlashGpuSnapshot::SerializePersistent(
     transfer.Copy(
         destination.data() + kDFlashGpuPersistentHeaderBytes + bytes_per_kind,
         d_v_, bytes_per_kind);
+    // One wait for the whole write; a queued copy's error only surfaces here.
+    transfer.FinishOrThrow();
   }
   return destination.size();
 }

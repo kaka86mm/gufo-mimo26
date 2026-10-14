@@ -30,7 +30,10 @@
 
       gufoPackages = forAllSystems (
         system:
-        pkgs.${system}.callPackage ./.devops/nix/scope.nix { inherit revision; }
+        pkgs.${system}.callPackage ./.devops/nix/scope.nix {
+          inherit revision;
+          pkgs = pkgs.${system};
+        }
       );
 
       llamaReferences = forAllSystems (
@@ -125,6 +128,7 @@
         in
         {
           default = base;
+          tp2-rdma = gufoPackages.${system}.tp2-rdma;
           # Official artifacts select this output from a tagged source. The
           # default package remains visibly developmental on moving branches.
           release = base.override { inherit releaseVersion; };
@@ -177,7 +181,10 @@
               export CCACHE_NOHASHDIR=true
             '';
           };
-
+          tp2-rdma = pkgs.${system}.mkShell {
+            inputsFrom = [ self.packages.${system}.tp2-rdma ];
+            packages = [ pkgs.${system}.clang-tools ];
+          };
         }
       );
 

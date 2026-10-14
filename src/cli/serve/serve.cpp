@@ -9,6 +9,8 @@
 #include <cmath>
 #include <csignal>
 #include <cstdint>
+#include <cstdio>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
@@ -33,6 +35,7 @@
 #include "src/cli/serve/image_api.hpp"
 #include "src/cli/serve/inference_backend.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/tp_control.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/core/diagnostics/gpu_queues.h"
 
@@ -40,6 +43,10 @@
 #include <hip/hip_runtime_api.h>
 #endif
 #include "src/cli/serve/trace.hpp"
+#ifdef GUFO_ENABLE_TP2_RDMA
+#include "src/models/mimo2/kernels/rocm/verbs.hpp"
+#include "src/core/gguf_reader.hpp"
+#endif
 #include "src/cli/serve/tts_service.hpp"
 #include "src/cli/serve/video_jobs.hpp"
 #include "src/cli/video/video.hpp"
@@ -611,6 +618,16 @@ void PrintServeHelp(std::string_view program_name,
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
+    std::uint32_t tp_rank = 0;
+    std::uint32_t tp_world_size = 1;
+    std::uint32_t tp_device = 0;
+    std::string tp_rdma_device;
+    std::uint32_t tp_rdma_port = 1;
+    std::int64_t tp_gid_index = -1;
+    std::uint32_t tp_bootstrap_port = 18515;
+    std::uint32_t tp_control_port = 18516;
+    std::string tp_bootstrap_host;
+    std::string tp_control_token;
     bool log_progress = false;
     std::string trace_path;
 
@@ -631,6 +648,33 @@ void PrintServeHelp(std::string_view program_name,
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    parser.AddOption("", "--tp-world-size", "N",
+                     "Qwen3.8-Flash-Next TP world size (1 or 2)", "TP2",
+                     &tp_world_size);
+    parser.AddOption("", "--tp-rank", "N", "TP rank (0 or 1)", "TP2", &tp_rank);
+    parser.AddOption("", "--tp-bootstrap-host", "HOST",
+                     "Rank-1 address of the rank-0 RDMA bootstrap", "TP2",
+                     &tp_bootstrap_host);
+    parser.AddOption("", "--tp-bootstrap-port", "N",
+                     "TCP bootstrap port (default: 18515)", "TP2",
+                     &tp_bootstrap_port);
+    parser.AddOption("", "--tp-control-port", "N",
+                     "TCP worker control port (default: 18516)", "TP2",
+                     &tp_control_port);
+    parser.AddOption("", "--tp-control-token", "TOKEN",
+                     "Shared token for TP worker authentication", "TP2",
+                     &tp_control_token);
+    parser.AddOption("", "--tp-device", "N", "HIP device index", "TP2",
+                     &tp_device);
+    parser.AddOption("", "--tp-rdma-device", "NAME",
+                     "RDMA device (default: the host's only one)", "TP2",
+                     &tp_rdma_device);
+    parser.AddOption("", "--tp-rdma-port", "N", "RDMA device port (default: 1)",
+                     "TP2", &tp_rdma_port);
+    parser.AddOption("", "--tp-gid-index", "N",
+                     "RDMA GID index (default: 0 on InfiniBand, the port's "
+                     "RoCE v2 GID on RoCE)",
+                     "TP2", &tp_gid_index);
 
     // Sampling Defaults
     parser.AddOption(
@@ -936,6 +980,7 @@ int RunServe(std::span<const char* const> args) {
   std::string parse_err;
 
   std::shared_ptr<server::InferenceBackend> backend;
+  bool tp_rank_zero = false;
   std::shared_ptr<server::VideoJobService> video_jobs;
   std::shared_ptr<server::TtsService> tts;
   std::shared_ptr<server::AsrService> asr;
@@ -1158,6 +1203,16 @@ int RunServe(std::span<const char* const> args) {
     std::size_t cache_disk_bytes =
         server::TextRunnerDiskCacheOptions::kDefaultCapacityBytes;
     std::size_t cache_disk_staging_bytes = 0;
+    std::uint32_t tp_rank = 0;
+    std::uint32_t tp_world_size = 1;
+    std::uint32_t tp_device = 0;
+    std::string tp_rdma_device;
+    std::uint32_t tp_rdma_port = 1;
+    std::int64_t tp_gid_index = -1;
+    std::uint32_t tp_bootstrap_port = 18515;
+    std::uint32_t tp_control_port = 18516;
+    std::string tp_bootstrap_host;
+    std::string tp_control_token;
     bool log_progress = false;
     std::string trace_path;
 
@@ -1177,6 +1232,34 @@ int RunServe(std::span<const char* const> args) {
         "-c", "--context", "N",
         "Context tokens per session (default: 0 = model native context)",
         "Model", &max_context);
+    llm_parser.AddOption("", "--tp-world-size", "N",
+                         "Qwen3.8-Flash-Next TP world size (1 or 2)", "TP2",
+                         &tp_world_size);
+    llm_parser.AddOption("", "--tp-rank", "N", "TP rank (0 or 1)", "TP2",
+                         &tp_rank);
+    llm_parser.AddOption("", "--tp-bootstrap-host", "HOST",
+                         "Rank-1 address of the rank-0 RDMA bootstrap", "TP2",
+                         &tp_bootstrap_host);
+    llm_parser.AddOption("", "--tp-bootstrap-port", "N",
+                         "TCP bootstrap port (default: 18515)", "TP2",
+                         &tp_bootstrap_port);
+    llm_parser.AddOption("", "--tp-control-port", "N",
+                         "TCP worker control port (default: 18516)", "TP2",
+                         &tp_control_port);
+    llm_parser.AddOption("", "--tp-control-token", "TOKEN",
+                         "Shared token for TP worker authentication", "TP2",
+                         &tp_control_token);
+    llm_parser.AddOption("", "--tp-device", "N", "HIP device index", "TP2",
+                         &tp_device);
+    llm_parser.AddOption("", "--tp-rdma-device", "NAME",
+                         "RDMA device (default: the host's only one)", "TP2",
+                         &tp_rdma_device);
+    llm_parser.AddOption("", "--tp-rdma-port", "N",
+                         "RDMA device port (default: 1)", "TP2", &tp_rdma_port);
+    llm_parser.AddOption("", "--tp-gid-index", "N",
+                         "RDMA GID index (default: 0 on InfiniBand, the "
+                         "port's RoCE v2 GID on RoCE)",
+                         "TP2", &tp_gid_index);
     llm_parser.AddOption(
         "-n", "--max-tokens", "N",
         "Default new-token limit (default: -1 = until EOS or context full)",
@@ -1396,6 +1479,144 @@ int RunServe(std::span<const char* const> args) {
       std::cerr << "Error: --model <PATH> is required\n";
       return 2;
     }
+    if (tp_world_size != 1 && tp_world_size != 2) {
+      std::cerr << "Error: --tp-world-size must be 1 or 2\n";
+      return 2;
+    }
+    if (tp_world_size == 1 && tp_rank != 0) {
+      std::cerr << "Error: single-rank TP requires --tp-rank 0\n";
+      return 2;
+    }
+    if (tp_rank >= tp_world_size) {
+      std::cerr << "Error: --tp-rank must be less than --tp-world-size\n";
+      return 2;
+    }
+    if (tp_world_size == 2 && (tp_rank == 1 && tp_bootstrap_host.empty())) {
+      std::cerr << "Error: rank one requires --tp-bootstrap-host\n";
+      return 2;
+    }
+    if (tp_bootstrap_port == 0 || tp_bootstrap_port > 65535 ||
+        tp_control_port == 0 || tp_control_port > 65535 ||
+        tp_bootstrap_port == tp_control_port ||
+        tp_device >
+            static_cast<std::uint32_t>(std::numeric_limits<int>::max()) ||
+        tp_rdma_port == 0 ||
+        tp_rdma_port > std::numeric_limits<std::uint8_t>::max() ||
+        tp_gid_index < -1 ||
+        tp_gid_index > std::numeric_limits<std::uint8_t>::max()) {
+      std::cerr << "Error: invalid TP2 network/device options\n";
+      return 2;
+    }
+    if (tp_world_size == 2 &&
+        (tp_control_token.empty() || tp_control_token.size() > 4096)) {
+      std::cerr << "Error: TP2 requires --tp-control-token\n";
+      return 2;
+    }
+
+    server::TextTpConfig tp_config{
+        .rank = tp_rank,
+        .world_size = tp_world_size,
+        .hip_device = static_cast<int>(tp_device),
+        .auth_token = tp_control_token,
+    };
+    std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>
+        tp_communicator;
+    std::shared_ptr<models::mimo2::rocm::Communicator> tp_mimo2_communicator;
+    std::shared_ptr<server::TpControlChannel> tp_control;
+    if (tp_world_size == 2 && tp_rank == 1) {
+      // Rank 1 serves nothing and keeps nothing worth saving: stop at once on
+      // SIGINT or SIGTERM, also while loading. As a container's PID 1 it
+      // would otherwise ignore them.
+      struct sigaction stop{};
+      stop.sa_handler = [](int) { std::_Exit(0); };
+      ::sigemptyset(&stop.sa_mask);
+      (void)::sigaction(SIGTERM, &stop, nullptr);
+      (void)::sigaction(SIGINT, &stop, nullptr);
+    }
+    if (tp_world_size == 2) {
+#ifdef GUFO_ENABLE_TP2_RDMA
+      const models::qwen38_flash_next::rocm::IbrverbsConfig rdma_config{
+          .rank = tp_rank,
+          .world_size = tp_world_size,
+          .bootstrap_host = tp_bootstrap_host,
+          .bootstrap_port = static_cast<std::uint16_t>(tp_bootstrap_port),
+          .device_index = tp_device,
+          .rdma_device = tp_rdma_device,
+          .rdma_port = tp_rdma_port,
+          .gid_index = tp_gid_index < 0
+                           ? std::nullopt
+                           : std::optional<std::uint32_t>(
+                                 static_cast<std::uint32_t>(tp_gid_index)),
+      };
+      std::string tp_error;
+      // A MiMo TP2 pair builds the mimo2 transport directly: it carries the
+      // graph-capture exchange protocol the executor-wide decode graphs
+      // need (the shared qwen38 communicator reaches the engine through the
+      // adapter without it, leaving every capture gated off). The kind is
+      // sniffed from the GGUF architecture ahead of loading.
+      const bool mimo2_tp = [&] {
+        std::string sniff_error;
+        auto sniff = core::GgufReader::OpenFile(model, &sniff_error);
+        return sniff != nullptr &&
+               sniff->GetMetadataString("general.architecture")
+                       .value_or(std::string_view{}) == "mimo2";
+      }();
+      if (mimo2_tp) {
+        const models::mimo2::rocm::IbrverbsConfig mimo2_rdma_config{
+            .rank = tp_rank,
+            .world_size = tp_world_size,
+            .bootstrap_host = tp_bootstrap_host,
+            .bootstrap_port = static_cast<std::uint16_t>(tp_bootstrap_port),
+            .device_index = static_cast<std::uint32_t>(tp_device),
+            .rdma_device = tp_rdma_device,
+            .rdma_port = tp_rdma_port,
+            .gid_index = tp_gid_index < 0
+                             ? std::nullopt
+                             : std::optional<std::uint32_t>(
+                                   static_cast<std::uint32_t>(tp_gid_index)),
+        };
+        tp_mimo2_communicator =
+            models::mimo2::rocm::CreateIbrverbsCommunicator(mimo2_rdma_config,
+                                                             &tp_error);
+        if (!tp_mimo2_communicator) {
+          std::cerr << "Error creating TP2 RDMA communicator: " << tp_error
+                    << '\n';
+          return 1;
+        }
+        server::Logger::Info(
+            "tp", "event=rdma_ready " + tp_mimo2_communicator->Describe());
+      } else {
+        tp_communicator =
+            models::qwen38_flash_next::rocm::CreateIbrverbsCommunicator(
+                rdma_config, &tp_error);
+        if (!tp_communicator) {
+          std::cerr << "Error creating TP2 RDMA communicator: " << tp_error
+                    << '\n';
+          return 1;
+        }
+        server::Logger::Info("tp",
+                             "event=rdma_ready " + tp_communicator->Describe());
+      }
+      tp_control =
+          tp_rank == 0
+              ? server::TpControlChannel::Listen(
+                    static_cast<std::uint16_t>(tp_control_port), &tp_error)
+              : server::TpControlChannel::Connect(
+                    tp_bootstrap_host,
+                    static_cast<std::uint16_t>(tp_control_port), &tp_error);
+      if (!tp_control) {
+        std::cerr << "Error creating TP2 worker control channel: " << tp_error
+                  << '\n';
+        return 1;
+      }
+#else
+      std::cerr << "Error: this build has no TP2 RDMA support\n";
+      return 2;
+#endif
+    }
+    tp_config.communicator = tp_communicator;
+    tp_config.mimo2_communicator = tp_mimo2_communicator;
+    tp_config.control = tp_control;
     std::string err;
     ModelLoadLog load_log("text", model);
     backend = std::make_shared<server::InferenceBackend>();
@@ -1429,7 +1650,7 @@ int RunServe(std::span<const char* const> args) {
                            .staging_capacity_bytes = cache_disk_staging_bytes,
                            .model_artifact_fingerprint = {},
                        },
-                       vision_model_path,
+                       vision_model_path, tp_config,
                        server::TextRunnerRamCacheOptions{
                            .capacity_bytes = cache_ram_bytes})) {
       std::cerr << "Error loading model '" << model << "': " << err << "\n";
@@ -1480,6 +1701,18 @@ int RunServe(std::span<const char* const> args) {
         std::to_string(backend->max_context()) + " speculative=" + speculation +
         " draft_limit=" + std::to_string(speculative_config.max_draft_tokens) +
         " disk_cache=" + (cache_disk_directory.empty() ? "off" : "enabled"));
+#if defined(ENGINE_ENABLE_HIP)
+    if (tp_world_size == 2 && tp_rank == 1) {
+      std::string worker_error;
+      if (!backend->run_worker(&worker_error)) {
+        server::Logger::Error("server",
+                              "event=tp_worker_failed reason=" + worker_error);
+        return 1;
+      }
+      return 0;
+    }
+#endif
+    tp_rank_zero = tp_world_size == 2;
   }
 
   // run() joins every request thread, so no hook call outlives it.
@@ -1510,6 +1743,29 @@ int RunServe(std::span<const char* const> args) {
       ::_exit(kDeviceLostExitStatus);
     }
   };
+  // Rank 0 of a TP2 pair whose peer or link is gone fails every request, so
+  // it exits for a supervisor to restart both ranks; rank 1 exits on its own.
+  // Requests that already failed get a moment to deliver their errors. The
+  // exit skips teardown, which could wait on an exchange the peer never ends.
+  std::atomic<bool> serving{true};
+  std::thread pair_watch;
+  if (tp_rank_zero) {
+    pair_watch = std::thread([&serving, backend] {
+      while (serving.load(std::memory_order_acquire)) {
+        std::this_thread::sleep_for(std::chrono::milliseconds(200));
+        const auto failure = backend->tp_failure();
+        if (failure.empty()) {
+          continue;
+        }
+        server::Logger::Error(
+            "server", "event=tp_pair_lost action=exit reason=" + failure);
+        std::this_thread::sleep_for(std::chrono::seconds(1));
+        std::cerr.flush();
+        std::fflush(nullptr);
+        std::_Exit(1);
+      }
+    });
+  }
   try {
     server.run(/*handle_signals=*/true);
   } catch (...) {
@@ -1517,6 +1773,10 @@ int RunServe(std::span<const char* const> args) {
     throw;
   }
   exit_if_device_lost();
+  serving.store(false, std::memory_order_release);
+  if (pair_watch.joinable()) {
+    pair_watch.join();
+  }
   return 0;
 }
 

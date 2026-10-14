@@ -1,0 +1,100 @@
+# User unit for the rank 0 (serving) host of a two-host gufo TP=2 server.
+#
+# The instance name is the quantization (q4, q8, ...); it selects the model
+# GUFO_MODEL_<INSTANCE> from head.env (gufo@q8 uses GUFO_MODEL_Q8):
+#
+#   systemctl --user start gufo@q8
+#
+# Brings up the rank 1 worker on the peer host first (GUFO_PEER), then the
+# rank 0 server in the foreground; stopping tears both down. This host holds
+# the whole configuration: before starting the worker it hands the worker's
+# user manager every shared setting (systemctl set-environment), so the peer
+# needs only its unit file, and both ranks always agree. Each start also
+# creates a new TP control token in this host's runtime directory (a tmpfs,
+# %t/gufo.token) and writes it through ssh's input into the peer's, so the
+# token is never stored on disk and never appears on a command line of ssh.
+# The rank container runs via "podman run --rm" (no -d): systemd owns the
+# process and the restart policy, and the container output is tagged with
+# this unit in the journal.
+#
+# Configuration: ~/.config/gufo/head.env (see head.env.example), host and
+# shared settings; a missing model for the instance fails the start.
+#
+# If another local user unit claims the GPU, add a drop-in
+# (gufo@.service.d/local.conf) with Conflicts=<unit>.
+[Unit]
+Description=Gufo TP=2 two-host LLM server, %i (rank 0)
+# A failing start check repeats three times at most per minute.
+StartLimitIntervalSec=60
+StartLimitBurst=3
+
+[Service]
+Type=exec
+Restart=on-failure
+RestartSec=5
+# gufo exits with 2 on invalid options, which a restart does not fix
+RestartPreventExitStatus=2
+TimeoutStopSec=5min
+SyslogIdentifier=gufo-rank0
+EnvironmentFile=%h/.config/gufo/head.env
+ExecStartPre=/bin/sh -c 'umask 077; od -An -tx1 -N24 /dev/urandom | tr -dc 0-9a-f > %t/gufo.token'
+# The worker connects to this host's address on the RDMA link: GUFO_TP_ADDR,
+# or the IPv4 address of GUFO_TP_NETDEV, or of the netdev of the only active
+# RDMA port 1 (the port the verbs communicator uses). With GUFO_TP_RDMA_DEVICE
+# set, or no unique RDMA netdev on real hardware, it is the address the peer's
+# ssh connection came from, since a USB4 rail's RoCE netdev may be a local
+# dummy. Only TCP
+# (bootstrap and control) uses this address; the exchanges use the device.
+ExecStartPre=/bin/sh -c '\
+  var=GUFO_MODEL_$(echo %i | tr a-z- A-Z_); model=$(printenv $var); \
+  [ -n "$model" ] || { echo "head.env sets no $var for gufo@%i" >&2; exit 1; }; \
+  dir=$${GUFO_MODEL_DIR:-/opt/models}; \
+  for f in "$model" "$GUFO_MODEL_MTP"; do [ -e "$dir/$f" ] || \
+    { echo "no model file $dir/$f" >&2; exit 1; }; done; \
+  [ -z "$GUFO_TP_RDMA_DEVICE" ] || [ -e "/sys/class/infiniband/$GUFO_TP_RDMA_DEVICE" ] || \
+    { echo "no RDMA device $GUFO_TP_RDMA_DEVICE (is its driver loaded?)" >&2; exit 1; }; \
+  addr=$GUFO_TP_ADDR; dev=$GUFO_TP_NETDEV; \
+  if [ -z "$addr" ] && [ -z "$dev" ] && [ -z "$GUFO_TP_RDMA_DEVICE" ]; then \
+    dev=$(rdma link show 2>/dev/null | grep "/1 " | grep "state ACTIVE" | sed -n "s/.* netdev \\([^ ]*\\).*/\\1/p" | sort -u); \
+    [ -n "$dev" ] || dev=$(for n in /sys/class/net/*; do [ -d "$n/device/infiniband" ] && [ "$(cat "$n/dev_port" 2>/dev/null)" = 0 ] && basename "$n"; done); \
+    [ "$(echo "$dev" | wc -w)" -eq 1 ] || dev=; \
+    [ -z "$dev" ] || [ -e "/sys/class/net/$dev/device" ] || dev=; \
+  fi; \
+  [ -n "$addr" ] || [ -z "$dev" ] || addr=$(ip -o -4 addr show dev "$dev" | awk "{print \\$4}" | cut -d/ -f1 | head -n 1); \
+  [ -n "$addr" ] || [ -z "$dev" ] || { echo "no IPv4 address on $dev: set GUFO_TP_ADDR" >&2; exit 1; }; \
+  [ -n "$addr" ] || addr=$(ssh -o ConnectTimeout=10 $GUFO_PEER "echo \\$SSH_CONNECTION" | cut -d" " -f1); \
+  [ -n "$addr" ] || { echo "no IPv4 address on $dev: set GUFO_TP_ADDR" >&2; exit 1; }; \
+  ssh -o ConnectTimeout=10 $GUFO_PEER "umask 077; cat > /run/user/\\$(id -u)/gufo.token || exit 1; \
+    systemctl --user stop \\"gufo-rank1@*.service\\"; \
+    systemctl --user set-environment GUFO_HEAD_HOST=$addr GUFO_IMAGE=$GUFO_IMAGE \
+      GUFO_MODEL_DIR=$GUFO_MODEL_DIR GUFO_MODEL=$model GUFO_MODEL_MTP=$GUFO_MODEL_MTP \
+      GUFO_SESSIONS=$GUFO_SESSIONS GUFO_MAX_PENDING=$GUFO_MAX_PENDING \
+      GUFO_CACHE_DISK_BYTES=$GUFO_CACHE_DISK_BYTES \
+      GUFO_CHECKOUT=$GUFO_CHECKOUT GUFO_CACHE_DIR=$GUFO_CACHE_DIR \
+      GUFO_TP_RDMA_DEVICE=$GUFO_TP_RDMA_DEVICE GUFO_RDMA_DRIVERS=$GUFO_RDMA_DRIVERS && \
+    systemctl --user start gufo-rank1@%i.service" < %t/gufo.token'
+ExecStartPre=/bin/sh -c 'cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
+  mkdir -p "$cache/gufo-tp2/%i" "$cache/gufo"'
+ExecStart=/bin/sh -c 'model=$(printenv GUFO_MODEL_$(echo %i | tr a-z- A-Z_)); \
+  dir=$${GUFO_MODEL_DIR:-/opt/models}; checkout=$${GUFO_CHECKOUT:-$HOME/git/gufo}; cache=$${GUFO_CACHE_DIR:-$HOME/.cache}; \
+  exec podman run --rm --log-driver none --security-opt label=disable \
+  --userns keep-id:uid=1000,gid=1000 \
+  --device /dev/kfd --device /dev/dri \
+  --device /dev/infiniband $${GUFO_RDMA_DRIVERS:+-v "$${GUFO_RDMA_DRIVERS%%/*}:$${GUFO_RDMA_DRIVERS%%/*}:ro" -e RDMAV_DRIVERS=$GUFO_RDMA_DRIVERS} \
+  --group-add keep-groups --ulimit memlock=-1 --network host \
+  -v "$checkout:/workspace/gufo:ro" -v "$dir:$dir:ro" \
+  -v "$cache/gufo-tp2/%i:/cache" \
+  -v "$cache/gufo:/xdg-cache/gufo" -e XDG_CACHE_HOME=/xdg-cache \
+  -w /workspace/gufo $GUFO_IMAGE build/gpu-tp2/gufo serve llm \
+  --model "$dir/$model" \
+  --speculative mtp --mtp-model "$dir/$GUFO_MODEL_MTP" \
+  --draft-tokens 7 \
+  --cache-disk /cache --cache-disk-bytes "$${GUFO_CACHE_DISK_BYTES:-68719476736}" \
+  --sessions $GUFO_SESSIONS --max-pending $GUFO_MAX_PENDING \
+  --served-model-name "$${GUFO_SERVED_MODEL_NAME:-qwen3.8-flash-next}" \
+  --tp-world-size 2 --tp-rank 0 \
+  --host $GUFO_HOST --port $GUFO_PORT \
+  --tp-bootstrap-port 18515 --tp-control-port 18516 \
+  $${GUFO_TP_RDMA_DEVICE:+--tp-rdma-device $GUFO_TP_RDMA_DEVICE} \
+  --tp-control-token "$(cat %t/gufo.token)"'
+ExecStopPost=/bin/sh -c 'ssh -o ConnectTimeout=10 $GUFO_PEER systemctl --user stop gufo-rank1@%i.service || true'

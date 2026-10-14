@@ -116,6 +116,7 @@ inline constexpr std::int8_t kValuesIq4Nl[16] = {
     case core::GgmlType::kQ8_1:
     case core::GgmlType::kQ8_0:
     case core::GgmlType::kIQ4_NL:
+    case core::GgmlType::kMXFP4:
       return 32;
     case core::GgmlType::kQ2_K:
     case core::GgmlType::kIQ2_XXS:
@@ -178,6 +179,9 @@ void DequantizeQ8_0(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ4_NL to float
 void DequantizeIQ4_NL(const void* src, float* dst, std::size_t k);
+
+// OCP MX block: one E8M0 scale plus 16 packed E2M1 values per 32 elements.
+void DequantizeMXFP4(const void* src, float* dst, std::size_t k);
 
 // Dequantize row of IQ4_XS to float
 void DequantizeIQ4_XS(const void* src, float* dst, std::size_t k);

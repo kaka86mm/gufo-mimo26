@@ -65,6 +65,7 @@ are not launched through the cache.
 | `gpu-test` | RelWithDebInfo + assertions | HIP, tests and development tools |
 | `cpu-test` | RelWithDebInfo | Host-only tests, no HIP |
 | `cpu-sanitizer` | Debug + ASan/UBSan | Host memory and undefined-behavior diagnostics |
+| `gpu-tp2` | RelWithDebInfo + assertions | `gpu-test` plus the optional two-host RDMA adapter |
 
 Build preset `pr` configures against `cpu-test` and runs the hosted contract
 target `check-pr`. Test presets: `cpu-test` (label `cpu`), `cpu-sanitizer`,
@@ -81,6 +82,7 @@ tree), `deepseek-gpu` and `qwen-gpu-kernel-oracle`. Definitions live in
 | `GUFO_BUILD_TOOLS` | `OFF` | Build kernel benchmarks and tuning executables |
 | `GUFO_ENABLE_WARNINGS` | `ON` | Compiler warnings |
 | `GUFO_ENABLE_SANITIZERS` | `OFF` | AddressSanitizer and UndefinedBehaviorSanitizer |
+| `GUFO_ENABLE_TP2_RDMA` | `OFF` | Two-host Qwen3.8 Flash-Next over InfiniBand RDMA; needs libibverbs and HIP ([TP2](models/qwen3.8-flash-next/TP2.md)) |
 | `GUFO_RELEASE_VERSION` | `development` | Reported semantic release version |
 | `GUFO_REVISION` | `unknown` | Reported source revision and provenance identity |
 | `GUFO_FFMPEG_EXECUTABLE`, `GUFO_FFPROBE_EXECUTABLE` | `ffmpeg`, `ffprobe` | External media executables |

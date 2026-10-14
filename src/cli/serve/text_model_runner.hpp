@@ -310,6 +310,17 @@ public:
       throw std::invalid_argument("model does not support this prompt context");
     }
   }
+  /// Serializes a context `PreparePrompt` made, for another process running
+  /// the same model to rebuild with `DecodePromptContext`: a TP2 peer, which
+  /// must configure its states exactly as this rank does.
+  [[nodiscard]] virtual std::vector<std::uint8_t> EncodePromptContext(
+      const TextPromptContext&) const {
+    throw std::invalid_argument("model cannot transfer this prompt context");
+  }
+  [[nodiscard]] virtual std::shared_ptr<const TextPromptContext>
+  DecodePromptContext(std::span<const std::uint8_t>) const {
+    throw std::invalid_argument("model cannot transfer this prompt context");
+  }
   [[nodiscard]] virtual TextGenerationBackend::InitialOutputState
   InitialOutputState(const ChatRequest&) const {
     return TextGenerationBackend::InitialOutputState::kAuto;
@@ -377,12 +388,34 @@ public:
       sampling::SamplerState& sampler) const;
   [[nodiscard]] virtual std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const;
+  /// The plan of a batched multi-token step: the draft count the whole batch
+  /// would use, when the runner chooses one (it may depend on timing), else
+  /// none. A TP2 peer runs the same batch with the same plan.
+  [[nodiscard]] virtual std::optional<std::uint32_t> PlanDecodeBatch(
+      std::span<const TextRunnerDecode>) const {
+    return std::nullopt;
+  }
+  /// DecodeBatch with a plan from PlanDecodeBatch, possibly made by a peer.
+  [[nodiscard]] virtual std::vector<TextDecodeStep> DecodeBatchPlanned(
+      std::span<const TextRunnerDecode> decodes,
+      std::optional<std::uint32_t>) const {
+    return DecodeBatch(decodes);
+  }
   virtual void AdvanceBatch(std::span<const TextRunnerAdvance> advances) const;
   [[nodiscard]] virtual std::size_t CheckpointPosition(
       const TextRunnerState& state) const = 0;
   /// Retain a safe executed frontier when cancellation interrupts publication
   /// of a completed speculative block. Called with cancellation checks cleared.
   virtual void PrepareCancellation(TextRunnerState&) const {}
+  /// False when a retained continuation must not be reused. A TP2 rank-0
+  /// runner refuses the states and snapshots of a request its peer rejected.
+  /// Consulted whenever a request looks up a reusable prefix.
+  [[nodiscard]] virtual bool CanReuse(const TextRunnerState&) const {
+    return true;
+  }
+  [[nodiscard]] virtual bool CanReuse(const TextRunnerSnapshot&) const {
+    return true;
+  }
   enum class DeviceProbeStatus { kUsable, kPending, kLost };
   /// Submit or poll one private device probe without waiting. Called only by
   /// the scheduler between work units. Pending work is reused, never queued
@@ -550,6 +583,7 @@ public:
   TextRunnerPool(TextRunnerPool&&) = delete;
   TextRunnerPool& operator=(TextRunnerPool&&) = delete;
 
+  void ClearCache();
   [[nodiscard]] const TextModelRunner& runner() const noexcept;
   [[nodiscard]] std::size_t capacity() const noexcept;
   [[nodiscard]] TextExecutionPlan SelectDecodePlan(

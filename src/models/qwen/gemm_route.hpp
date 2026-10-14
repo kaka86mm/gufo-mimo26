@@ -95,6 +95,10 @@ struct QwenGemmFormatCapabilities {
     case core::GgmlType::kQ2_K:
     case core::GgmlType::kIQ2_XXS:
       return {.quantized = true};
+    // No in-kernel decoder here; mimo2's vendored mmq tier owns MXFP4.
+    case core::GgmlType::kMXFP4:
+      return {.quantized = true,
+              .block_elements = ::gufo::quant::QuantizedBlockElements(type)};
   }
   return {};
 }

@@ -4,9 +4,13 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <chrono>
+#include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <exception>
 #include <filesystem>
 #include <fstream>
 #include <iomanip>
@@ -18,6 +22,7 @@
 #include <span>
 #include <sstream>
 #include <stdexcept>
+#include <tuple>
 #include <thread>
 #include <type_traits>
 #include <utility>
@@ -26,6 +31,8 @@
 #include "src/cli/serve/logging.hpp"
 #include "src/cli/serve/text_generation_scheduler.hpp"
 #include "src/cli/serve/text_model_runner.hpp"
+#include "src/cli/serve/tp_control.hpp"
+#include "src/cli/serve/tp_executor.hpp"
 #include "src/core/gguf_identity.hpp"
 #include "src/core/gguf_reader.hpp"
 #include "src/core/json.hpp"
@@ -41,11 +48,17 @@
 #include "src/core/speculative/speculative_verifier.hpp"
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
+#include "src/models/mimo2/chat_template.hpp"
+#include "src/models/mimo2/dflash_v1.hpp"
+#include "src/models/mimo2/dflash_v1_target.hpp"
+#include "src/models/mimo2/engine.hpp"
+#include "src/models/mimo2/kernels/rocm/communicator.hpp"
 #include "src/models/qwen/hip/detail/attention_policy.hpp"
 #include "src/models/qwen/hip/dflash.hpp"
 #include "src/models/qwen/hip/executor.hpp"
 #include "src/models/qwen38_flash_next/continuation_adapter.hpp"
 #include "src/models/qwen38_flash_next/engine.hpp"
+#include "src/models/qwen38_flash_next/kernels/rocm/communicator.hpp"
 #endif
 
 namespace gufo::server {
@@ -69,6 +82,64 @@ void SetError(std::string* error, std::string message) {
 }
 
 #if defined(ENGINE_ENABLE_HIP)
+/// Binds the communicator's operation scope to the instruction index of the
+/// model call running on this rank, so a call's exchanges pair only with the
+/// same call's exchanges on the peer, whichever requests are open.
+class CommunicatorCallScope final : public TpCallScope {
+public:
+  explicit CommunicatorCallScope(
+      std::shared_ptr<models::qwen38_flash_next::rocm::Communicator>
+          communicator)
+      : communicator_(std::move(communicator)) {
+    if (communicator_ == nullptr) {
+      throw std::invalid_argument("TP call scope needs a communicator");
+    }
+  }
+
+  [[nodiscard]] bool Begin(std::uint64_t index, std::string* error) override {
+    return communicator_->BeginOperation(index, error);
+  }
+  [[nodiscard]] bool End(std::uint64_t index, std::string* error) override {
+    return communicator_->EndOperation(index, error);
+  }
+
+private:
+  std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator_;
+};
+
+/// The mimo2 transport's twin of CommunicatorCallScope (the interfaces are
+/// parallel copies; a native mimo2 TP2 pair binds its own).
+class Mimo2CommunicatorCallScope final : public TpCallScope {
+public:
+  explicit Mimo2CommunicatorCallScope(
+      std::shared_ptr<models::mimo2::rocm::Communicator> communicator)
+      : communicator_(std::move(communicator)) {
+    if (communicator_ == nullptr) {
+      throw std::invalid_argument("TP call scope needs a communicator");
+    }
+  }
+
+  [[nodiscard]] bool Begin(std::uint64_t index, std::string* error) override {
+    return communicator_->BeginOperation(index, error);
+  }
+  [[nodiscard]] bool End(std::uint64_t index, std::string* error) override {
+    return communicator_->EndOperation(index, error);
+  }
+
+private:
+  std::shared_ptr<models::mimo2::rocm::Communicator> communicator_;
+};
+
+/// The call scope for whichever transport the serve CLI built: the native
+/// mimo2 communicator when a MiMo pair built it, else the shared qwen38 one.
+[[nodiscard]] std::shared_ptr<TpCallScope> MakeTpCallScope(
+    const TextTpConfig& tp_config) {
+  if (tp_config.mimo2_communicator != nullptr) {
+    return std::make_shared<Mimo2CommunicatorCallScope>(
+        tp_config.mimo2_communicator);
+  }
+  return std::make_shared<CommunicatorCallScope>(tp_config.communicator);
+}
 
 struct QwenImageContext final : TextPromptContext {
   std::shared_ptr<const models::qwen::vision::Prompt> prompt;
@@ -155,6 +226,115 @@ std::shared_ptr<const models::qwen::vision::Prompt> QwenPrompt(
   if (!image)
     throw std::invalid_argument("invalid Qwen prompt context");
   return image->prompt;
+}
+
+// A Qwen image context for a TP2 peer: the prompt's tokens, RoPE layout,
+// resized pixels and cache identity, so the peer encodes the same images.
+constexpr std::uint32_t kQwenImageContextFormat = 1;
+
+std::vector<std::uint8_t> EncodeQwenImageContext(
+    const TextPromptContext& context) {
+  const auto* image = dynamic_cast<const QwenImageContext*>(&context);
+  if (image == nullptr || image->prompt == nullptr)
+    throw std::invalid_argument("invalid Qwen prompt context");
+  const auto& prompt = *image->prompt;
+  std::vector<std::uint8_t> out;
+  const auto u32 = [&](std::uint64_t value) {
+    if (value > std::numeric_limits<std::uint32_t>::max())
+      throw std::invalid_argument("Qwen prompt context is too large");
+    for (unsigned shift = 0; shift < 32; shift += 8)
+      out.push_back(static_cast<std::uint8_t>(value >> shift));
+  };
+  const auto grid = [&](const models::qwen::vision::ImageGrid& value) {
+    u32(value.offset);
+    u32(value.height);
+    u32(value.width);
+  };
+  u32(kQwenImageContextFormat);
+  u32(prompt.cache_identity.size());
+  out.insert(out.end(), prompt.cache_identity.begin(),
+             prompt.cache_identity.end());
+  u32(prompt.tokens.size());
+  for (const auto token : prompt.tokens)
+    u32(token);
+  u32(prompt.rope.images.size());
+  for (const auto& value : prompt.rope.images)
+    grid(value);
+  u32(prompt.images.size());
+  for (const auto& value : prompt.images) {
+    grid(value.grid);
+    u32(value.pixels.width);
+    u32(value.pixels.height);
+    u32(value.pixels.pixels.size());
+    out.insert(out.end(), value.pixels.pixels.begin(),
+               value.pixels.pixels.end());
+  }
+  return out;
+}
+
+std::shared_ptr<const TextPromptContext> DecodeQwenImageContext(
+    std::span<const std::uint8_t> bytes, std::uint32_t max_context) {
+  std::size_t offset = 0;
+  const auto u32 = [&]() {
+    if (bytes.size() - offset < 4)
+      throw std::invalid_argument("Qwen prompt context is truncated");
+    std::uint32_t value = 0;
+    for (unsigned shift = 0; shift < 32; shift += 8)
+      value |= std::uint32_t{bytes[offset++]} << shift;
+    return value;
+  };
+  const auto span = [&](std::size_t size) {
+    if (bytes.size() - offset < size)
+      throw std::invalid_argument("Qwen prompt context is truncated");
+    const auto result = bytes.subspan(offset, size);
+    offset += size;
+    return result;
+  };
+  const auto grid = [&]() {
+    models::qwen::vision::ImageGrid value;
+    value.offset = u32();
+    value.height = u32();
+    value.width = u32();
+    return value;
+  };
+  if (u32() != kQwenImageContextFormat)
+    throw std::invalid_argument("Qwen prompt context format is unknown");
+  auto prompt = std::make_shared<models::qwen::vision::Prompt>();
+  const auto identity = span(u32());
+  prompt->cache_identity.assign(identity.begin(), identity.end());
+  const auto token_count = u32();
+  if (token_count == 0 || token_count > max_context)
+    throw std::invalid_argument("Qwen prompt context tokens are invalid");
+  prompt->tokens.resize(token_count);
+  for (auto& token : prompt->tokens)
+    token = u32();
+  const auto rope_count = u32();
+  if (rope_count > token_count)
+    throw std::invalid_argument("Qwen prompt context layout is invalid");
+  prompt->rope.images.resize(rope_count);
+  for (auto& value : prompt->rope.images)
+    value = grid();
+  prompt->rope.Validate(max_context);
+  const auto image_count = u32();
+  if (image_count == 0 || image_count > rope_count)
+    throw std::invalid_argument("Qwen prompt context images are invalid");
+  prompt->images.resize(image_count);
+  for (auto& value : prompt->images) {
+    value.grid = grid();
+    value.pixels.width = u32();
+    value.pixels.height = u32();
+    const auto size = u32();
+    if (std::uint64_t{value.pixels.width} * value.pixels.height * 3 != size)
+      throw std::invalid_argument("Qwen prompt context pixels are invalid");
+    const auto pixels = span(size);
+    value.pixels.pixels.assign(pixels.begin(), pixels.end());
+  }
+  if (offset != bytes.size())
+    throw std::invalid_argument("Qwen prompt context has trailing bytes");
+  auto context = std::make_shared<QwenImageContext>();
+  context->cache_identity = prompt->cache_identity;
+  context->prompt = std::move(prompt);
+  return context;
 }
 
 constexpr std::string_view kDeepSeekStateAbi =
@@ -262,6 +442,46 @@ std::vector<std::uint8_t> QwenFlashNextCompatibilityIdentity(
            << "adapters=none\n";
   if (has_mtp) {
     identity << "draft_backend=qfn-mtp-v1\n"
+             << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
+             << mtp_fingerprint << '\n'
+             << "draft_max_tokens=" << max_draft_tokens << '\n'
+             << "draft_cost_concurrency=" << decode_concurrency << '\n';
+  }
+  const std::string canonical = identity.str();
+  return {canonical.begin(), canonical.end()};
+}
+
+std::vector<std::uint8_t> Mimo2CompatibilityIdentity(
+    std::string_view artifact_fingerprint, std::string_view mtp_fingerprint,
+    bool has_mtp, std::uint32_t max_context, std::uint32_t max_draft_tokens,
+    std::uint32_t decode_concurrency) {
+  if (!IsSha256Hex(artifact_fingerprint)) {
+    throw std::invalid_argument(
+        "MiMo disk cache requires an artifact fingerprint");
+  }
+  if (has_mtp && !IsSha256Hex(mtp_fingerprint)) {
+    throw std::invalid_argument(
+        "MiMo MTP disk cache requires a draft artifact fingerprint");
+  }
+  std::ostringstream identity;
+  identity << "schema=gufo-text-continuation-v2\n"
+           << "model_kind=mimo2\n"
+           << "artifact_id=" << core::kGgufIdentityScheme << ':'
+           << artifact_fingerprint << '\n'
+           << "tokenizer=embedded-in-artifact\n"
+           << "chat_template=" << models::mimo2::ChatTemplateId() << '\n'
+           // Empty until the artifact digest is pinned; the identity then
+           // changes, which is the intended cache invalidation.
+           << "chat_template_reference_sha256="
+           << models::mimo2::ArtifactTemplateSha256() << '\n'
+           << "state_abi=mimo2-rocm-session-v1\n"
+           << "payload_layout=mimo2-rocm-session-snapshot-v"
+           << models::mimo2::Session::kSnapshotPayloadVersion << '\n'
+           << "context_tokens=" << max_context << '\n'
+           << "position_policy=absolute-v1\n"
+           << "adapters=none\n";
+  if (has_mtp) {
+    identity << "draft_backend=mimo2-mtp-v1\n"
              << "draft_artifact_id=" << core::kGgufIdentityScheme << ':'
              << mtp_fingerprint << '\n'
              << "draft_max_tokens=" << max_draft_tokens << '\n'
@@ -768,7 +988,6 @@ private:
         .piece = std::string(model_->GetTokenizer().DecodeToken(token)),
     });
     sequence_.push_back(token);
-    set_pending_token(token);
     sampler.Accept(token);
     return true;
   }
@@ -2343,6 +2562,8 @@ bool FingerprintArtifactFile(std::string_view label,
 constexpr std::string_view kQwenFlashNextStateAbi =
     "qwen38-flash-next-rocm-session-v1";
 
+constexpr std::string_view kMimo2StateAbi = "mimo2-rocm-session-v1";
+
 using QwenFlashNextModel = models::qwen38_flash_next::Model;
 using QwenFlashNextSession = models::qwen38_flash_next::Session;
 
@@ -2429,7 +2650,8 @@ public:
       : model_(std::move(model)),
         max_context_(max_context),
         use_mtp_(use_mtp),
-        max_draft_tokens_(max_draft_tokens) {
+        max_draft_tokens_(max_draft_tokens),
+        distributed_(model_->TpWorldSize() > 1) {
     // The typed in-process API owns an immutable loaded model but need not
     // supply file fingerprints when disk caching is disabled. Its model
     // lifetime is an exact process-local identity; durable caches still
@@ -2444,6 +2666,14 @@ public:
               models::qwen38_flash_next::Session::kSnapshotPayloadVersion,
       };
       component_identity_ = persistence_->compatibility_identity;
+      if (distributed_) {
+        // A TP rank's snapshot holds only its half of the split state.
+        const std::string rank =
+            "tp_rank=" + std::to_string(model_->TpRank()) +
+            "\ntp_world_size=" + std::to_string(model_->TpWorldSize()) + "\n";
+        auto& identity = persistence_->compatibility_identity;
+        identity.insert(identity.end(), rank.begin(), rank.end());
+      }
     } else {
       std::ostringstream identity;
       identity << "schema=gufo-process-text-continuation-v1\n"
@@ -2693,6 +2923,9 @@ public:
   }
 
   [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    // Under TP2 batched multi-token decoding is not qualified, so a batch of
+    // MTP requests advances one token each; a request decoding alone still
+    // takes multi-token steps.
     std::vector<TextExecutionPlan> plans{
         {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
     for (std::size_t width = 2; width <= 8; ++width) {
@@ -2744,6 +2977,19 @@ public:
       std::shared_ptr<const TextPromptContext> context) const override {
     RequireQwenFlashNextState(state).session().ConfigureVision(
         QwenPrompt(context));
+  }
+
+  [[nodiscard]] std::vector<std::uint8_t> EncodePromptContext(
+      const TextPromptContext& context) const override {
+    return EncodeQwenImageContext(context);
+  }
+
+  [[nodiscard]] std::shared_ptr<const TextPromptContext> DecodePromptContext(
+      std::span<const std::uint8_t> bytes) const override {
+    if (model_->VisionEncoder() == nullptr) {
+      throw std::invalid_argument("image input requires --mmproj");
+    }
+    return DecodeQwenImageContext(bytes, max_context_);
   }
 
   [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
@@ -3002,6 +3248,36 @@ public:
 
   [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
       std::span<const TextRunnerDecode> decodes) const override {
+    return RunDecodeBatch(decodes, nullptr);
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    if (decodes.size() < 2 || !use_mtp_) {
+      return std::nullopt;
+    }
+    std::vector<QwenFlashNextSession::DecodeRequest> requests;
+    requests.reserve(decodes.size());
+    for (const auto& decode : decodes) {
+      requests.push_back(
+          {&RequireQwenFlashNextState(decode.state.get()).session(),
+           std::min<std::size_t>(decode.max_tokens,
+                                 std::uint64_t{max_draft_tokens_} + 1),
+           &decode.sampler.get(), nullptr});
+    }
+    return QwenFlashNextSession::PlanBatch(requests);
+  }
+
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatchPlanned(
+      std::span<const TextRunnerDecode> decodes,
+      std::optional<std::uint32_t> plan) const override {
+    return RunDecodeBatch(decodes, &plan);
+  }
+
+  /// `plan`, when given, fixes the batch's draft count (a TP2 peer's choice).
+  [[nodiscard]] std::vector<TextDecodeStep> RunDecodeBatch(
+      std::span<const TextRunnerDecode> decodes,
+      const std::optional<std::uint32_t>* plan) const {
     if (decodes.size() < 2 || !use_mtp_) {
       return TextModelRunner::DecodeBatch(decodes);
     }
@@ -3026,7 +3302,7 @@ public:
            &sampler, &results[i], state.stop_at_eos(), &outcomes[i]});
     }
     std::string error;
-    (void)QwenFlashNextSession::DecodeBatch(requests, &error);
+    (void)QwenFlashNextSession::DecodeBatch(requests, &error, plan);
     const auto active_count = static_cast<std::size_t>(std::count_if(
         results.begin(), results.end(),
         [](const auto& result) { return !result.tokens.empty(); }));
@@ -3064,8 +3340,1460 @@ private:
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
+  bool distributed_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
   cache::Identity component_identity_;
+};
+
+using Mimo2Model = models::mimo2::Model;
+using Mimo2Session = models::mimo2::Session;
+
+std::vector<std::int32_t> Mimo2EngineTokens(
+    std::span<const TextRunnerToken> tokens) {
+  std::vector<std::int32_t> converted;
+  converted.reserve(tokens.size());
+  for (const TextRunnerToken token : tokens) {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("MiMo token ID exceeds engine range");
+    }
+    converted.push_back(static_cast<std::int32_t>(token));
+  }
+  return converted;
+}
+
+models::mimo2::ChatTemplateOptions Mimo2ChatOptions(
+    const ChatRequest& request) {
+  auto options = models::mimo2::ResolveMimoChatOptions(request.reasoning);
+  options.require_tool_call =
+      request.tool_choice == ChatRequest::ToolChoice::kRequired;
+  return options;
+}
+
+/// The CLI builds one qwen38 ibverbs communicator for every TP2 load; the
+/// mimo2 engine declares its own textually identical interface, so the serve
+/// layer adapts here instead of growing the CLI surface. Every method
+/// forwards to the same transport object the control channel uses.
+class Mimo2CommunicatorAdapter final : public models::mimo2::rocm::Communicator {
+public:
+  explicit Mimo2CommunicatorAdapter(
+      std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> inner)
+      : inner_(std::move(inner)) {
+    if (inner_ == nullptr) {
+      throw std::invalid_argument("MiMo TP2 needs a communicator");
+    }
+  }
+
+  [[nodiscard]] std::uint32_t rank() const noexcept override {
+    return inner_->rank();
+  }
+  [[nodiscard]] std::uint32_t world_size() const noexcept override {
+    return inner_->world_size();
+  }
+  [[nodiscard]] int device_index() const noexcept override {
+    return inner_->device_index();
+  }
+  [[nodiscard]] std::string Describe() const override {
+    return inner_->Describe();
+  }
+  [[nodiscard]] bool BeginOperation(std::uint64_t scope_id,
+                                    std::string* error) override {
+    return inner_->BeginOperation(scope_id, error);
+  }
+  [[nodiscard]] bool EndOperation(std::uint64_t scope_id,
+                                  std::string* error) override {
+    return inner_->EndOperation(scope_id, error);
+  }
+  [[nodiscard]] const float* ExchangePartial(const float* data,
+                                             std::size_t bytes,
+                                             hipStream_t stream,
+                                             std::string* error) override {
+    return inner_->ExchangePartial(data, bytes, stream, error);
+  }
+  [[nodiscard]] bool StartPartial(const float* data, std::size_t bytes,
+                                  hipStream_t stream,
+                                  std::string* error) override {
+    return inner_->StartPartial(data, bytes, stream, error);
+  }
+  [[nodiscard]] const float* FinishPartial(std::size_t bytes,
+                                           std::string* error) override {
+    return inner_->FinishPartial(bytes, error);
+  }
+  [[nodiscard]] bool QueuePartial(
+      std::size_t bytes, QueuedPartial* partial,
+      std::string* error) override {
+    if (partial == nullptr) {
+      return inner_->QueuePartial(
+          bytes,
+          nullptr,
+          error);
+    }
+    // The inner call fills its own struct; copy every field back so the
+    // caller receives the actual window pointers (the one-way copy left the
+    // output zeroed and crashed the first exchange on null pointers).
+    models::qwen38_flash_next::rocm::Communicator::QueuedPartial forwarded;
+    if (!inner_->QueuePartial(bytes, &forwarded, error)) {
+      return false;
+    }
+    *partial = models::mimo2::rocm::Communicator::QueuedPartial{
+        forwarded.send,
+        forwarded.peer,
+        forwarded.ready,
+        forwarded.arrived,
+        forwarded.value,
+        forwarded.arrivals,
+        forwarded.timed_out,
+        forwarded.wait_ticks};
+    return true;
+  }
+  [[nodiscard]] bool CheckQueued(std::string* error) override {
+    return inner_->CheckQueued(error);
+  }
+
+private:
+  std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> inner_;
+};
+
+class Mimo2TextRunnerState final : public TextRunnerState {
+public:
+  /// `dflash_model` selects the DFlash v1 speculative path: the generic
+  /// SpeculativeVerifier drives a DFlashV1Target over its own plain session
+  /// while the MTP engine session stays unused.
+  Mimo2TextRunnerState(
+      const std::shared_ptr<Mimo2Model>& model, std::uint32_t max_context,
+      bool use_mtp,
+      std::shared_ptr<const models::mimo2::DFlashV1Model> dflash_model,
+      std::uint32_t dflash_max_draft_tokens)
+      : model_(model) {
+    std::string error;
+    if (dflash_model != nullptr) {
+      dflash_target_ =
+          models::mimo2::DFlashV1Target::Create(model, max_context, &error);
+      if (dflash_target_ == nullptr) {
+        throw std::runtime_error("Failed to create MiMo DFlash target: " +
+                                 error);
+      }
+      auto backend = models::mimo2::DFlashV1DraftBackend::Create(
+          std::move(dflash_model), max_context, dflash_max_draft_tokens,
+          &error);
+      if (backend == nullptr) {
+        throw std::runtime_error("Failed to create MiMo DFlash backend: " +
+                                 error);
+      }
+      draft_backend_ = backend.get();
+      speculative::SpeculativeOptions options;
+      options.max_draft_tokens = dflash_max_draft_tokens;
+      options.min_draft_tokens = 1;
+      options.initial_draft_tokens = dflash_max_draft_tokens;
+      options.use_batched_verification = true;
+      options.retain_frontier_logits = true;
+      options.enable_adaptive_draft_length = false;
+      verifier_ = std::make_unique<speculative::SpeculativeVerifier>(
+          *dflash_target_, std::move(backend), options);
+      return;
+    }
+    session_ =
+        model->CreateSession(use_mtp ? gufo::core::SessionMode::kSpeculative
+                                     : gufo::core::SessionMode::kAutoregressive,
+                             max_context, &error);
+    if (session_ == nullptr) {
+      throw std::runtime_error("Failed to create MiMo session: " + error);
+    }
+  }
+
+  void Invalidate() noexcept override {
+    // States come from a pool: the next request starts speculating again.
+    ar_mode_ = false;
+    if (speculative()) {
+      verifier_->Reset();
+      dflash_target_->Reset();
+      sequence_.clear();
+      position_ = 0;
+      frontier_.reset();
+      frontier_logits_.clear();
+      frontier_published_ = false;
+      return;
+    }
+    session_->SetCancellationCheck({});
+    session_->Reset();
+    position_ = 0;
+  }
+  void SetCancellationCheck(const CancellationCheck& check) override {
+    if (speculative()) {
+      // A DFlash cycle runs verification to completion; cancellation is
+      // observed at the request boundary (Invalidate).
+      return;
+    }
+    session_->SetCancellationCheck(check);
+  }
+  [[nodiscard]] TextRunnerMeasuredResources MeasuredResources()
+      const noexcept override {
+    if (speculative()) {
+      return {.per_request_state_bytes =
+                  dflash_target_->AllocatedBytes() +
+                  (draft_backend_ != nullptr
+                       ? draft_backend_->DrafterStateBytes()
+                       : 0),
+              .temporary_scratch_bytes = 0};
+    }
+    return {.per_request_state_bytes = session_->AllocatedBytes(),
+            .temporary_scratch_bytes = 0};
+  }
+
+  [[nodiscard]] bool speculative() const noexcept {
+    return verifier_ != nullptr;
+  }
+  [[nodiscard]] Mimo2Session& session() const { return *session_; }
+  [[nodiscard]] models::mimo2::DFlashV1Target& dflash() const {
+    return *dflash_target_;
+  }
+  [[nodiscard]] std::size_t position() const noexcept { return position_; }
+  void set_position(std::size_t position) noexcept { position_ = position; }
+
+  void PrimeSpeculative(std::span<const TextRunnerToken> prompt,
+                        bool decode_ready) {
+    if (verifier_ == nullptr) {
+      throw std::logic_error("MiMo state has no speculative verifier");
+    }
+    frontier_ = verifier_->Prime(prompt, decode_ready);
+    frontier_logits_.clear();
+    if (decode_ready) {
+      const auto logits = verifier_->CopyLastTargetLogits();
+      frontier_logits_.assign(logits.begin(), logits.end());
+    }
+    sequence_.assign(prompt.begin(), prompt.end());
+    position_ = prompt.size();
+    frontier_published_ = false;
+  }
+
+  void ExtendSpeculative(std::span<const TextRunnerToken> suffix,
+                         bool decode_ready) {
+    if (verifier_ == nullptr || !frontier_.has_value()) {
+      throw std::logic_error("MiMo speculative prefix is not initialized");
+    }
+    if (sequence_.size() != position_) {
+      throw std::logic_error(
+          "MiMo speculative sequence does not match retained position");
+    }
+    frontier_ = verifier_->ExtendPrompt(
+        suffix, static_cast<std::uint32_t>(position_), decode_ready);
+    sequence_.insert(sequence_.end(), suffix.begin(), suffix.end());
+    position_ += suffix.size();
+    frontier_logits_.clear();
+    if (decode_ready) {
+      const auto logits = verifier_->CopyLastTargetLogits();
+      frontier_logits_.assign(logits.begin(), logits.end());
+    }
+    frontier_published_ = false;
+  }
+
+  [[nodiscard]] TextRunnerToken SelectFrontier(
+      sampling::SamplerState& sampler) const {
+    if (!frontier_.has_value()) {
+      throw std::logic_error("MiMo state has no next-token frontier");
+    }
+    if (sampler.config().can_use_unmodified_argmax()) {
+      return *frontier_;
+    }
+    if (frontier_logits_.empty()) {
+      return dflash_target_->SampleLastLogits(sampler);
+    }
+    return sampler.Sample(frontier_logits_);
+  }
+
+  [[nodiscard]] bool PrepareSpeculativeDecode(std::size_t max_tokens,
+                                              sampling::SamplerState& sampler,
+                                              TextDecodeStep& result) {
+    if (verifier_ == nullptr || !frontier_.has_value()) {
+      throw std::logic_error("MiMo speculative state has no frontier");
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "MiMo speculative decode budget must be at least one token");
+    }
+    if (!frontier_published_) {
+      if (!sampler.config().can_use_unmodified_argmax())
+        frontier_ = SelectFrontier(sampler);
+      if (!AppendSpeculativeSelection(*frontier_, sampler, result))
+        return false;
+      frontier_published_ = true;
+    }
+    return result.selections.size() < max_tokens;
+  }
+
+  [[nodiscard]] speculative::SpeculativeVerifier::StepRequest
+  VerificationRequest(std::size_t remaining, sampling::SamplerState& sampler) {
+    // The verifier's contract keeps the current token as the sequence's last
+    // element, and the draft backend anchors its block on it. A verification
+    // step emits its frontier, so later steps already end on the frontier;
+    // the step right after the prompt does not.
+    verify_sequence_.assign(sequence_.begin(), sequence_.end());
+    if (verify_sequence_.empty() || verify_sequence_.back() != *frontier_) {
+      verify_sequence_.push_back(*frontier_);
+    }
+    return {*verifier_,
+            verify_sequence_,
+            static_cast<std::uint32_t>(position_),
+            *frontier_,
+            model_->tokenizer().GetEosTokenId(),
+            static_cast<std::uint32_t>(std::min<std::size_t>(
+                remaining, std::numeric_limits<std::uint32_t>::max())),
+            sampler};
+  }
+
+  void FinishSpeculativeDecode(
+      speculative::SpeculativeVerifier::StepResult verification,
+      sampling::SamplerState& sampler, TextDecodeStep& result) {
+    result.draft_tokens = verification.draft_count;
+    result.draft_accepted_tokens = verification.accepted_count;
+    result.execution_plan = {
+        .kind = TextExecutionPlanKind::kSerial,
+        .physical_width = 1,
+    };
+    static const bool trace = std::getenv("GUFO_DFLASH_TRACE") != nullptr;
+    if (trace) {
+      fprintf(stderr,
+              "[DFTRACE] step pos=%zu drafted=%zu accepted=%zu verify_ms=%.1f\n",
+              position_, verification.draft_count, verification.accepted_count,
+              step_start_ms_ > 0.0 ? SteadyMs() - step_start_ms_ : 0.0);
+      fflush(stderr);
+    }
+    if (draft_backend_ != nullptr && trace && verification.draft_count > 0) {
+      // Compare the draft's first-position logits against the target's own
+      // row for the same position: the cosine and the rank of each side's
+      // argmax tell whether the drafter is conditioned on this context.
+      const auto draft_row = draft_backend_->CopyProposalLogits(0);
+      const auto target_row = dflash_target_->CopyVerificationLogits(0);
+      if (!draft_row.empty() && draft_row.size() == target_row.size()) {
+        double dot = 0.0;
+        double draft_norm = 0.0;
+        double target_norm = 0.0;
+        for (std::size_t i = 0; i < draft_row.size(); ++i) {
+          dot += static_cast<double>(draft_row[i]) * target_row[i];
+          draft_norm += static_cast<double>(draft_row[i]) * draft_row[i];
+          target_norm += static_cast<double>(target_row[i]) * target_row[i];
+        }
+        const auto rank_of = [](std::span<const float> row,
+                                std::size_t id) {
+          std::size_t rank = 0;
+          for (std::size_t i = 0; i < row.size(); ++i) {
+            if (row[i] > row[id]) {
+              ++rank;
+            }
+          }
+          return rank;
+        };
+        std::size_t draft_best = 0;
+        std::size_t target_best = 0;
+        for (std::size_t i = 1; i < draft_row.size(); ++i) {
+          if (draft_row[i] > draft_row[draft_best]) {
+            draft_best = i;
+          }
+          if (target_row[i] > target_row[target_best]) {
+            target_best = i;
+          }
+        }
+        const double cosine =
+            dot / (std::sqrt(draft_norm) * std::sqrt(target_norm) + 1e-9);
+        const auto spread = [](std::span<const float> row) {
+          double mean = 0.0;
+          for (const float value : row) {
+            mean += value;
+          }
+          mean /= static_cast<double>(row.size());
+          double variance = 0.0;
+          float best = row[0];
+          float second = row[0];
+          for (const float value : row) {
+            variance += (value - mean) * (value - mean);
+            if (value > best) {
+              second = best;
+              best = value;
+            } else if (value > second) {
+              second = value;
+            }
+          }
+          return std::tuple(best, second, std::sqrt(variance / row.size()));
+        };
+        const auto draft_spread = spread(draft_row);
+        const auto target_spread = spread(target_row);
+        fprintf(stderr,
+                "[DFTRACE] logits cosine=%.4f draft_top=%zu target_top=%zu "
+                "rank(target_in_draft)=%zu rank(draft_in_target)=%zu\n"
+                "      draft: max=%.3f second=%.3f std=%.4f | "
+                "target: max=%.3f second=%.3f std=%.4f\n",
+                cosine, draft_best, target_best, rank_of(draft_row, target_best),
+                rank_of(target_row, draft_best), std::get<0>(draft_spread),
+                std::get<1>(draft_spread), std::get<2>(draft_spread),
+                std::get<0>(target_spread), std::get<1>(target_spread),
+                std::get<2>(target_spread));
+        fflush(stderr);
+      }
+    }
+    for (const TextRunnerToken token : verification.emitted_tokens) {
+      ++position_;
+      if (!AppendSpeculativeSelection(token, sampler, result))
+        break;
+    }
+    frontier_ = verification.next_token;
+    frontier_logits_ = std::move(verification.next_token_logits);
+    frontier_published_ = !result.stop;
+  }
+
+  static double SteadyMs() {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now().time_since_epoch())
+        .count();
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeSpeculative(
+      std::size_t max_tokens, sampling::SamplerState& sampler) {
+    TextDecodeStep result;
+    sampling::SamplerState working_sampler = sampler;
+    step_start_ms_ = SteadyMs();
+    if (PrepareSpeculativeDecode(max_tokens, working_sampler, result)) {
+      const auto request = VerificationRequest(
+          max_tokens - result.selections.size(), working_sampler);
+      auto verification = verifier_->VerifyStep(
+          sequence_, request.position, request.current_token, request.eos_id,
+          request.max_emitted_tokens, working_sampler);
+      FinishSpeculativeDecode(std::move(verification), working_sampler, result);
+    }
+    sampler.SetRngState(working_sampler.rng_state());
+    return result;
+  }
+
+  /// Consumes one already-selected token through the target and re-frontiers
+  /// the draft. A one-token decode budget (the tail of a request, and the
+  /// base runner's single-token step) lands here instead of a verification
+  /// cycle, so the target state and the draft history stay exact.
+  void AdvanceSpeculative(TextRunnerToken token) {
+    if (draft_backend_ == nullptr) {
+      throw std::logic_error("MiMo DFlash state has no draft backend");
+    }
+    const auto next = dflash_target_->ForwardToken(
+        token, static_cast<std::uint32_t>(position_), /*compute_logits=*/true);
+    const auto hidden = dflash_target_->CopyLastHidden();
+    if (hidden.empty() ||
+        !draft_backend_->AppendTargetContext(
+            {.prompt_tokens = std::span<const tokenization::TokenId>(&token, 1),
+             .prompt_hidden_states = hidden,
+             .hidden_size = hidden.size(),
+             .first_token = next},
+            static_cast<std::uint32_t>(position_))) {
+      throw std::runtime_error(
+          "MiMo DFlash advance failed to append the committed target token");
+    }
+    sequence_.push_back(token);
+    ++position_;
+    frontier_ = next;
+    frontier_logits_.clear();
+    frontier_published_ = false;
+  }
+
+  // ── Autoregressive fallback ──────────────────────────────────────────────
+  //
+  // Cycles shared with other requests run plain autoregressive rows: on this
+  // engine a drafted row costs more than it wins once rows are shared, and one
+  // verification per session serializes a whole batch. A state that has shared
+  // a cycle stays on this path (the drafter is never fed again), while a
+  // request decoding alone keeps speculating.
+
+  [[nodiscard]] bool ArMode() const noexcept { return ar_mode_; }
+
+  /// Moves the state onto the autoregressive path. Refuses — leaving the
+  /// speculative path in charge — when the emitted prefix and the target's
+  /// frontier disagree, so a mis-modelled move cannot double-feed a token.
+  [[nodiscard]] bool SwitchToAr(std::string* error_msg) {
+    if (!ar_mode_) {
+      if (verifier_ == nullptr || !frontier_.has_value()) {
+        if (error_msg != nullptr) {
+          *error_msg = "MiMo DFlash state has no frontier to anchor on";
+        }
+        return false;
+      }
+      // The verify path keeps the already-emitted frontier inside `sequence_`;
+      // the autoregressive path keeps `sequence_` to the consumed prefix.
+      if (!sequence_.empty() && sequence_.back() == *frontier_) {
+        sequence_.pop_back();
+      }
+      // `position_` is the target's consumed count, so these are the move's own
+      // consistency checks: a mis-modelled prefix stays on the speculative path
+      // instead of double-feeding a token.
+      if (sequence_.size() != position_ ||
+          dflash_target_->Position() != position_) {
+        if (error_msg != nullptr) {
+          *error_msg = "MiMo DFlash prefix does not match the target frontier";
+        }
+        return false;
+      }
+      ar_mode_ = true;
+      if (std::getenv("GUFO_DFLASH_AR_TRACE") != nullptr) {
+        fprintf(stderr, "[DFLASH-AR] switched pos=%zu seq=%zu\n", position_,
+                sequence_.size());
+        fflush(stderr);
+      }
+    }
+    // Every request re-primes a pooled state and the prompt path arms the tap
+    // capture again, so the disarm has to follow the switch, not precede it.
+    return dflash_target_->DisarmCapture(error_msg);
+  }
+
+  /// The AR path's own consistency check: the target's consumed count must
+  /// match the state's, which the feed and the frontier accounting maintain.
+  [[nodiscard]] bool ArConsistent() const {
+    return dflash_target_ != nullptr &&
+           dflash_target_->Position() == position_;
+  }
+  [[nodiscard]] std::size_t ArSequenceSize() const noexcept {
+    return sequence_.size();
+  }
+
+  struct ArCycle {
+    /// The already-selected token this cycle feeds to the target.
+    std::int32_t feed{0};
+    bool stopped{false};
+  };
+
+  /// Emits a frontier that has not been published yet and names the token the
+  /// cycle feeds.
+  ArCycle PrepareArCycle(std::size_t max_tokens,
+                         sampling::SamplerState& sampler,
+                         TextDecodeStep& result) {
+    if (!ar_mode_ || verifier_ == nullptr) {
+      throw std::logic_error(
+          "MiMo DFlash state is not on the autoregressive path");
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "MiMo DFlash decode budget must be at least one token");
+    }
+    if (!frontier_published_) {
+      if (!sampler.config().can_use_unmodified_argmax()) {
+        frontier_ = SelectFrontier(sampler);
+      }
+      if (!AppendArSelection(*frontier_, sampler, result)) {
+        return {.stopped = true};
+      }
+      frontier_published_ = true;
+    }
+    return {.feed = static_cast<std::int32_t>(*frontier_),
+            .stopped = result.selections.size() >= max_tokens};
+  }
+
+  /// Ticks one autoregressive row: the cycle's token has been fed to the
+  /// target, so `sequence_`/`position_` follow that consumption and the row's
+  /// successor is sampled and emitted.
+  void FinishArCycle(sampling::SamplerState& sampler,
+                     TextDecodeStep& result) {
+    const auto logits = dflash_target_->CopyLastLogits();
+    if (logits.empty()) {
+      throw std::runtime_error(
+          "MiMo DFlash autoregressive row has no logits");
+    }
+    sequence_.push_back(*frontier_);
+    ++position_;
+    const auto next = static_cast<TextRunnerToken>(sampler.Sample(logits));
+    frontier_ = next;
+    frontier_logits_.clear();
+    if (stop_at_eos() && model_->tokenizer().IsStopToken(next)) {
+      result.stop = true;
+      frontier_published_ = false;
+      return;
+    }
+    AppendArSelection(next, sampler, result);
+    frontier_published_ = true;
+  }
+
+  /// Consumes one already-selected token through the target and re-frontiers
+  /// it, without touching the drafter.
+  void AdvanceAr(TextRunnerToken token) {
+    const auto next = dflash_target_->ForwardToken(
+        token, static_cast<std::uint32_t>(position_), /*compute_logits=*/true);
+    sequence_.push_back(token);
+    ++position_;
+    frontier_ = next;
+    frontier_logits_.clear();
+    frontier_published_ = false;
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeAr(std::size_t max_tokens,
+                                        sampling::SamplerState& sampler) {
+    TextDecodeStep result;
+    sampling::SamplerState working_sampler = sampler;
+    auto cycle = PrepareArCycle(max_tokens, working_sampler, result);
+    while (!cycle.stopped && !result.stop) {
+      std::string error;
+      if (!dflash_target_->Evaluate(cycle.feed, &error)) {
+        throw std::runtime_error(
+            "MiMo DFlash autoregressive step failed: " + error);
+      }
+      FinishArCycle(working_sampler, result);
+      if (result.stop || result.selections.size() >= max_tokens) {
+        break;
+      }
+      cycle = PrepareArCycle(max_tokens, working_sampler, result);
+    }
+    if (std::getenv("GUFO_DFLASH_AR_TRACE") != nullptr &&
+        !ArConsistent()) {
+      fprintf(stderr, "[DFLASH-AR] INVARIANT target=%u state=%zu seq=%zu\n",
+              dflash_target_->Position(), position_, sequence_.size());
+      fflush(stderr);
+    }
+    sampler.SetRngState(working_sampler.rng_state());
+    return result;
+  }
+
+private:
+  bool AppendSpeculativeSelection(TextRunnerToken token,
+                                  sampling::SamplerState& sampler,
+                                  TextDecodeStep& result) {
+    if (stop_at_eos() && model_->tokenizer().IsStopToken(token)) {
+      result.stop = true;
+      return false;
+    }
+    result.selections.push_back({
+        .stop = false,
+        .token = token,
+        .piece = std::string(model_->tokenizer().DecodeToken(token)),
+    });
+    sequence_.push_back(token);
+    sampler.Accept(token);
+    return true;
+  }
+
+  /// Emits one selected token. Unlike the speculative path it leaves the
+  /// token out of `sequence_`: the autoregressive path keeps that list to the
+  /// consumed prefix, and the feed is what consumes.
+  bool AppendArSelection(TextRunnerToken token,
+                         sampling::SamplerState& sampler,
+                         TextDecodeStep& result) {
+    if (stop_at_eos() && model_->tokenizer().IsStopToken(token)) {
+      result.stop = true;
+      return false;
+    }
+    result.selections.push_back({
+        .stop = false,
+        .token = token,
+        .piece = std::string(model_->tokenizer().DecodeToken(token)),
+    });
+    sampler.Accept(token);
+    return true;
+  }
+
+  std::shared_ptr<Mimo2Model> model_;
+  std::unique_ptr<Mimo2Session> session_;
+  std::unique_ptr<models::mimo2::DFlashV1Target> dflash_target_;
+  std::unique_ptr<speculative::SpeculativeVerifier> verifier_;
+  /// Owned by verifier_; used only to account the session's draft allocations.
+  models::mimo2::DFlashV1DraftBackend* draft_backend_{nullptr};
+  std::vector<TextRunnerToken> sequence_;
+  /// `sequence_` plus the current frontier, as the verifier expects it.
+  std::vector<TextRunnerToken> verify_sequence_;
+  /// Bring-up timing: when the current decode step started (0 disables).
+  double step_start_ms_{0.0};
+  std::optional<TextRunnerToken> frontier_;
+  std::vector<float> frontier_logits_;
+  bool frontier_published_{false};
+  /// Sticky once a cycle has been shared with another request.
+  bool ar_mode_{false};
+  std::size_t position_{0};
+};
+
+class Mimo2TextRunnerSnapshot final : public TextRunnerSnapshot {
+public:
+  Mimo2TextRunnerSnapshot(
+      std::shared_ptr<Mimo2Model> model,
+      std::unique_ptr<models::mimo2::SessionSnapshot> snapshot,
+      std::size_t position)
+      : model(std::move(model)),
+        snapshot(std::move(snapshot)),
+        position(position) {}
+
+  [[nodiscard]] std::size_t PayloadBytes() const noexcept override {
+    if (snapshot == nullptr ||
+        snapshot->SizeBytes() > static_cast<std::uint64_t>(
+                                    std::numeric_limits<std::size_t>::max())) {
+      return 0;
+    }
+    return static_cast<std::size_t>(snapshot->SizeBytes());
+  }
+
+  std::shared_ptr<Mimo2Model> model;
+  std::unique_ptr<models::mimo2::SessionSnapshot> snapshot;
+  std::size_t position;
+};
+
+Mimo2TextRunnerState& RequireMimo2State(TextRunnerState& state) {
+  auto* mimo = dynamic_cast<Mimo2TextRunnerState*>(&state);
+  if (mimo == nullptr) {
+    throw std::logic_error("text runner state is not MiMo");
+  }
+  return *mimo;
+}
+
+const Mimo2TextRunnerState& RequireMimo2State(const TextRunnerState& state) {
+  const auto* mimo = dynamic_cast<const Mimo2TextRunnerState*>(&state);
+  if (mimo == nullptr) {
+    throw std::logic_error("text runner state is not MiMo");
+  }
+  return *mimo;
+}
+
+class Mimo2TextRunner final : public TextModelRunner {
+public:
+  Mimo2TextRunner(std::shared_ptr<Mimo2Model> model,
+                  std::uint32_t max_context, bool use_mtp,
+                  std::uint32_t max_draft_tokens,
+                  std::string artifact_fingerprint = {},
+                  std::string mtp_fingerprint = {},
+                  std::shared_ptr<const models::mimo2::DFlashV1Model>
+                      dflash_model = nullptr,
+                  std::uint32_t dflash_max_draft_tokens = 7)
+      : model_(std::move(model)),
+        max_context_(max_context),
+        use_mtp_(use_mtp),
+        max_draft_tokens_(max_draft_tokens),
+        dflash_model_(std::move(dflash_model)),
+        dflash_max_draft_tokens_(dflash_max_draft_tokens),
+        distributed_(model_->TpWorldSize() > 1) {
+    if (!artifact_fingerprint.empty()) {
+      persistence_ = TextRunnerPersistenceDescriptor{
+          .compatibility_identity = Mimo2CompatibilityIdentity(
+              artifact_fingerprint, use_mtp_ ? mtp_fingerprint : std::string{},
+              use_mtp_, max_context_, max_draft_tokens_,
+              model_->DecodeConcurrency()),
+          .payload_version = models::mimo2::Session::kSnapshotPayloadVersion,
+      };
+      if (distributed_) {
+        // A TP rank's snapshot holds only its half of the split state.
+        const std::string rank =
+            "tp_rank=" + std::to_string(model_->TpRank()) +
+            "\ntp_world_size=" + std::to_string(model_->TpWorldSize()) + "\n";
+        auto& identity = persistence_->compatibility_identity;
+        identity.insert(identity.end(), rank.begin(), rank.end());
+      }
+    }
+  }
+
+  [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
+    return {
+        .model_id = model_->ModelName(),
+        .state_abi = std::string(kMimo2StateAbi),
+        .max_context = max_context_,
+        .capabilities =
+            TextRunnerCapabilities{
+                .incremental_prefill = true,
+                // DFlash sessions keep no serializable draft state yet, so
+                // they opt out of snapshots, forking and prefix reuse.
+                .snapshot = !use_dflash(),
+                .fork = !use_dflash(),
+                .final_token_advance_required = false,
+                .incremental_text_is_exact = true,
+                .multi_token_decode = use_mtp_ || use_dflash(),
+                // A DFlash batch decodes its sessions one verification at a
+                // time, but it must still claim the batched entry point:
+                // the one-token batch path would advance single tokens.
+                .batched_multi_token_decode = use_mtp_ || use_dflash(),
+                .batched_multi_token_decode_max_width = use_mtp_ ? 8u : 0u,
+                .prefix_reuse = !use_dflash(),
+            },
+        .persistence = use_dflash() ? std::nullopt : persistence_,
+    };
+  }
+
+  [[nodiscard]] TextRunnerResourceClaim ResourceClaim() const override {
+    std::size_t free_bytes = 0;
+    std::size_t total_bytes = 0;
+    std::optional<std::size_t> capacity;
+    if (hipMemGetInfo(&free_bytes, &total_bytes) == hipSuccess) {
+      const auto deferred = model_->DeferredScratchBytes();
+      capacity = free_bytes > deferred ? free_bytes - deferred : 0;
+    }
+    // Snapshots live in host memory, not in the device state pool.
+    std::size_t per_request = model_->SessionBytes(
+        use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                 : gufo::core::SessionMode::kAutoregressive,
+        max_context_);
+    if (use_dflash() && dflash_model_ != nullptr) {
+      // The sidecar draft state lives beside the target session; the claim
+      // has to cover it, or the load-time reconcile rejects a configuration
+      // whose real footprint fits.
+      per_request += models::mimo2::DFlashV1DraftBackend::StateBytesFor(
+          *dflash_model_, max_context_);
+    }
+    return {
+        .resident_weights_bytes = model_->ResidentBytes(),
+        .state_capacity_bytes = capacity,
+        .per_request_state_bytes = per_request,
+        // Runtime scratch is shared and already allocated at model load;
+        // reserve its remaining lazy buffers once from aggregate capacity.
+        .temporary_scratch_bytes = 0,
+        .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .requires_device_runtime_lock = true,
+    };
+  }
+
+  [[nodiscard]] std::vector<TextExecutionPlan> SupportedPlans() const override {
+    // Under TP2 batched multi-token decoding is not qualified, so a batch of
+    // MTP requests advances one token each; a request decoding alone still
+    // takes multi-token steps.
+    std::vector<TextExecutionPlan> plans{
+        {.kind = TextExecutionPlanKind::kSerial, .physical_width = 1}};
+    for (std::size_t width = 2; width <= 8; ++width) {
+      plans.push_back(
+          {.kind = TextExecutionPlanKind::kBatched, .physical_width = width});
+    }
+    return plans;
+  }
+
+  [[nodiscard]] std::shared_ptr<const sampling::ConstraintVocabulary>
+  BuildConstraintVocabulary() const override {
+    return std::make_shared<const sampling::ConstraintVocabulary>(
+        model_->tokenizer().GetVocabSize(), [this](std::uint32_t id) {
+          const auto& tokenizer = model_->tokenizer();
+          return sampling::ConstraintVocabulary::Piece{
+              tokenizer.DecodeTokenCopy(id), tokenizer.IsStopToken(id)};
+        });
+  }
+
+  [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
+      std::string_view text) const override {
+    return model_->tokenizer().Encode(text);
+  }
+
+  [[nodiscard]] std::optional<std::vector<TextRunnerToken>> RenderAndTokenize(
+      const ChatRequest& request) const override {
+    std::vector<models::mimo2::ChatMessage> messages;
+    messages.reserve(request.messages.size());
+    for (const auto& message : request.messages) {
+      models::mimo2::ChatMessage converted{
+          .role = std::string(ChatRoleName(message.role)),
+          .content = message.content,
+          .reasoning_content = message.thought,
+          .tool_calls = {},
+          .tool_call_id = message.tool_call_id,
+      };
+      converted.tool_calls.reserve(message.tool_calls.size());
+      for (const auto& call : message.tool_calls) {
+        models::mimo2::ChatMessage::ToolCall converted_call{
+            .name = call.name,
+            .arguments = {},
+            .id = call.id,
+        };
+        converted_call.arguments.reserve(call.arguments.size());
+        for (const auto& argument : call.arguments) {
+          converted_call.arguments.push_back({
+              .name = argument.name,
+              .value = argument.value,
+              .is_string = argument.is_string,
+          });
+        }
+        converted.tool_calls.push_back(std::move(converted_call));
+      }
+      messages.push_back(std::move(converted));
+    }
+
+    std::vector<models::mimo2::ChatTool> tools;
+    if (request.tool_choice != ChatRequest::ToolChoice::kNone) {
+      tools.reserve(request.tools.size());
+      for (const auto& tool : request.tools) {
+        tools.push_back({
+            .name = tool.name,
+            .description = tool.description,
+            .parameters_json = tool.parameters_json,
+            .definition_json = tool.definition_json,
+        });
+      }
+    }
+    return models::mimo2::RenderAndTokenize(
+        model_->tokenizer(), messages,
+        request.tool_choice == ChatRequest::ToolChoice::kNone
+            ? std::span<const models::mimo2::ChatTool>{}
+            : std::span<const models::mimo2::ChatTool>{tools},
+        Mimo2ChatOptions(request));
+  }
+
+  [[nodiscard]] std::optional<TextPreparedPrompt> PreparePrompt(
+      const ChatRequest& request) const override {
+    for (const auto& message : request.messages) {
+      if (!message.images.empty()) {
+        throw std::invalid_argument("MiMo does not support image input");
+      }
+    }
+    auto tokens = RenderAndTokenize(request);
+    if (!tokens) {
+      return std::nullopt;
+    }
+    return TextPreparedPrompt{std::move(*tokens), {}};
+  }
+
+  void SetPromptContext(
+      TextRunnerState& state,
+      std::shared_ptr<const TextPromptContext> context) const override {
+    // MiMo has no vision tower; only the shared null context is valid.
+    (void)state;
+    if (context != nullptr) {
+      throw std::invalid_argument("MiMo does not support image input");
+    }
+  }
+
+  [[nodiscard]] TextGenerationBackend::InitialOutputState InitialOutputState(
+      const ChatRequest& request) const override {
+    return Mimo2ChatOptions(request).enable_thinking
+               ? TextGenerationBackend::InitialOutputState::kReasoning
+               : TextGenerationBackend::InitialOutputState::kContent;
+  }
+
+  [[nodiscard]] std::string Decode(
+      std::span<const TextRunnerToken> tokens) const override {
+    return model_->tokenizer().Decode(tokens);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> CreateState() const override {
+    return std::make_unique<Mimo2TextRunnerState>(
+        model_, max_context_, use_mtp_, dflash_model_,
+        dflash_max_draft_tokens_);
+  }
+
+  void PreparePrefixReuse(
+      TextRunnerState& state,
+      std::span<const TextRunnerToken> prefix) const override {
+    const auto& mimo = RequireMimo2State(state);
+    if (mimo.position() != prefix.size()) {
+      throw std::logic_error("MiMo reused prefix does not match checkpoint");
+    }
+    if (mimo.speculative()) {
+      return;  // DFlash sessions do not join the continuation cache.
+    }
+    mimo.session().ResetDraftPolicy();
+  }
+
+  [[nodiscard]] TextPrefillStep Prefill(
+      TextRunnerState& state, std::span<const TextRunnerToken> prompt,
+      std::size_t offset, std::size_t max_input_tokens) const override {
+    auto& mimo = RequireMimo2State(state);
+    if (offset != mimo.position()) {
+      throw std::logic_error("MiMo prefill offset does not match retained state");
+    }
+    if (offset >= prompt.size()) {
+      throw std::logic_error("MiMo prefill has no remaining input");
+    }
+    if (mimo.speculative()) {
+      const std::size_t consumed = std::min<std::size_t>(
+          {max_input_tokens, prompt.size() - offset,
+           model_->PrefillCapacity()});
+      const std::size_t next_position = offset + consumed;
+      const bool decode_ready = next_position == prompt.size();
+      if (offset == 0) {
+        mimo.PrimeSpeculative(prompt.first(next_position), decode_ready);
+      } else {
+        mimo.ExtendSpeculative(prompt.subspan(offset, consumed), decode_ready);
+      }
+      return {
+          .consumed_tokens = consumed,
+          .decode_ready = decode_ready,
+      };
+    }
+    const std::size_t consumed = std::min<std::size_t>(
+        {max_input_tokens, prompt.size() - offset, model_->PrefillCapacity()});
+    const std::size_t next_position = offset + consumed;
+    const auto prefix = Mimo2EngineTokens(prompt.first(next_position));
+    if (offset == 0) {
+      // A fresh prompt starts its own acceptance history: sessions come from
+      // a pool, and the width policy would otherwise carry the previous
+      // request's hit rate (measured at -15% throughput on a list prompt
+      // after an unrelated prose prompt).
+      mimo.session().ResetDraftPolicy();
+    }
+    std::string error;
+    if (!mimo.session().Sync(prefix, &error)) {
+      mimo.set_position(0);
+      throw std::runtime_error("MiMo prefill failed: " + error);
+    }
+    mimo.set_position(next_position);
+    return {
+        .consumed_tokens = consumed,
+        .decode_ready = next_position == prompt.size(),
+    };
+  }
+
+  [[nodiscard]] TextDecodeSelection SelectNext(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    auto& mimo = RequireMimo2State(state);
+    if (mimo.position() >= max_context_) {
+      return {.stop = true, .piece = {}};
+    }
+    if (mimo.speculative()) {
+      const TextRunnerToken token = mimo.SelectFrontier(sampler);
+      if (mimo.stop_at_eos() && model_->tokenizer().IsStopToken(token)) {
+        return {.stop = true, .token = 0, .piece = {}};
+      }
+      return {
+          .stop = false,
+          .token = token,
+          .piece = std::string(model_->tokenizer().DecodeToken(token)),
+      };
+    }
+    const auto logits = mimo.session().Logits();
+    if (logits.empty()) {
+      throw std::runtime_error("MiMo token selection has no logits");
+    }
+    const auto token = static_cast<std::int32_t>(sampler.Sample(logits));
+    if (mimo.stop_at_eos() && model_->IsStopToken(token)) {
+      return {.stop = true, .token = 0, .piece = {}};
+    }
+    return {
+        .stop = false,
+        .token = static_cast<TextRunnerToken>(token),
+        .piece = model_->TokenText(token),
+    };
+  }
+
+  void Advance(TextRunnerState& state, TextRunnerToken token) const override {
+    if (token > static_cast<TextRunnerToken>(
+                    std::numeric_limits<std::int32_t>::max())) {
+      throw std::invalid_argument("MiMo token ID exceeds engine range");
+    }
+    auto& mimo = RequireMimo2State(state);
+    if (mimo.speculative()) {
+      if (mimo.ArMode()) {
+        mimo.AdvanceAr(token);
+      } else {
+        mimo.AdvanceSpeculative(token);
+      }
+      return;
+    }
+    std::string error;
+    if (!mimo.session().Evaluate(static_cast<std::int32_t>(token), &error)) {
+      throw std::runtime_error("MiMo decode failed: " + error);
+    }
+    mimo.set_position(mimo.position() + 1);
+  }
+
+  [[nodiscard]] std::optional<TextDecodeSelection> PreviewFirstToken(
+      TextRunnerState& state, sampling::SamplerState& sampler) const override {
+    return SelectNext(state, sampler);
+  }
+
+  [[nodiscard]] TextDecodeStep DecodeStep(
+      TextRunnerState& state, std::size_t max_tokens,
+      sampling::SamplerState& sampler) const override {
+    auto& mimo = RequireMimo2State(state);
+    // DFlash sessions never take the generic one-token path: their state
+    // advances only through verification, so even a one-token budget runs
+    // through the speculative decoder.
+    if (mimo.speculative()) {
+      if (max_tokens == 0) {
+        throw std::invalid_argument(
+            "MiMo DFlash decode budget must be at least one token");
+      }
+      if (mimo.ArMode()) {
+        return mimo.DecodeAr(max_tokens, sampler);
+      }
+      return mimo.DecodeSpeculative(max_tokens, sampler);
+    }
+    if (!use_mtp_ || max_tokens == 1) {
+      return TextModelRunner::DecodeStep(state, max_tokens, sampler);
+    }
+    if (max_tokens == 0) {
+      throw std::invalid_argument(
+          "MiMo MTP decode budget must be at least one token");
+    }
+    if (mimo.position() >= max_context_) {
+      return {.selections = {}, .stop = true};
+    }
+    const auto stats_before = mimo.session().Statistics();
+    sampling::SamplerState working_sampler = sampler;
+    Mimo2Session::DecodeResult decoded;
+    std::string error;
+    const auto budget =
+        std::min<std::size_t>(max_tokens, std::uint64_t{max_draft_tokens_} + 1);
+    if (!mimo.session().DecodeStep(budget, working_sampler, &decoded, &error,
+                                   mimo.stop_at_eos())) {
+      throw std::runtime_error("MiMo MTP decode failed: " + error);
+    }
+    // The pool accepts the returned tokens once. Publish the RNG and residual
+    // draw so the next batch retains the rejection-conditioned distribution.
+    sampler.CopyDrawStateFrom(working_sampler);
+    TextDecodeStep step;
+    step.stop = decoded.stop;
+    step.selections.reserve(decoded.tokens.size());
+    for (const std::int32_t token : decoded.tokens) {
+      step.selections.push_back({
+          .stop = false,
+          .token = static_cast<TextRunnerToken>(token),
+          .piece = model_->TokenText(token),
+      });
+    }
+    mimo.set_position(mimo.session().Position());
+    const auto stats_after = mimo.session().Statistics();
+    step.draft_tokens = stats_after.drafted - stats_before.drafted;
+    step.draft_accepted_tokens = stats_after.accepted - stats_before.accepted;
+    return step;
+  }
+
+  void AdvanceBatch(
+      std::span<const TextRunnerAdvance> advances) const override {
+    if (advances.size() < 2) {
+      return TextModelRunner::AdvanceBatch(advances);
+    }
+    for (const auto& advance : advances) {
+      if (RequireMimo2State(advance.state.get()).speculative()) {
+        return TextModelRunner::AdvanceBatch(advances);
+      }
+    }
+    std::vector<Mimo2Session::BatchOutcome> outcomes(advances.size());
+    std::vector<Mimo2Session::AdvanceRequest> requests;
+    for (const auto& advance : advances) {
+      if (advance.token > static_cast<TextRunnerToken>(
+                              std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument("MiMo token exceeds engine range");
+      }
+      requests.push_back(
+          {&RequireMimo2State(advance.state.get()).session(),
+           static_cast<std::int32_t>(advance.token),
+           &outcomes[requests.size()]});
+    }
+    std::string error;
+    (void)Mimo2Session::EvaluateBatch(requests, &error);
+    for (std::size_t i = 0; i < advances.size(); ++i) {
+      const auto& advance = advances[i];
+      if (!outcomes[i].completed) {
+        auto failure = std::make_exception_ptr(
+            std::runtime_error("MiMo advance failed: " + outcomes[i].error));
+        if (!advance.failure)
+          std::rethrow_exception(failure);
+        *advance.failure = failure;
+        continue;
+      }
+      auto& state = RequireMimo2State(advance.state.get());
+      state.set_position(state.session().Position());
+    }
+  }
+
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    return RunDecodeBatch(decodes, nullptr);
+  }
+
+  [[nodiscard]] std::optional<std::uint32_t> PlanDecodeBatch(
+      std::span<const TextRunnerDecode> decodes) const override {
+    if (decodes.size() < 2 || !use_mtp_) {
+      return std::nullopt;
+    }
+    for (const auto& decode : decodes) {
+      if (RequireMimo2State(decode.state.get()).speculative()) {
+        return std::nullopt;  // DFlash batches run their own autoregressive cycle.
+      }
+    }
+    std::vector<Mimo2Session::DecodeRequest> requests;
+    requests.reserve(decodes.size());
+    for (const auto& decode : decodes) {
+      requests.push_back(
+          {&RequireMimo2State(decode.state.get()).session(),
+           std::min<std::size_t>(decode.max_tokens,
+                                 std::uint64_t{max_draft_tokens_} + 1),
+           &decode.sampler.get(), nullptr});
+    }
+    return Mimo2Session::PlanBatch(requests);
+  }
+
+  [[nodiscard]] std::vector<TextDecodeStep> DecodeBatchPlanned(
+      std::span<const TextRunnerDecode> decodes,
+      std::optional<std::uint32_t> plan) const override {
+    return RunDecodeBatch(decodes, &plan);
+  }
+
+  /// A shared cycle advances every DFlash session with one plain
+  /// autoregressive row, merged into a single trunk pass. Speculating per
+  /// session (drafts, then one verification each) serializes the batch, and a
+  /// drafted row is not worth its cost once rows are shared on this engine.
+  [[nodiscard]] std::vector<TextDecodeStep> RunDflashArBatch(
+      std::span<const TextRunnerDecode> decodes) const {
+    const auto count = decodes.size();
+    std::vector<TextDecodeStep> steps(count);
+    std::vector<Mimo2TextRunnerState*> states(count, nullptr);
+    std::vector<models::mimo2::DFlashV1Target*> targets;
+    std::vector<std::int32_t> feed;
+    std::vector<std::size_t> rows;
+    std::vector<sampling::SamplerState> samplers;
+    targets.reserve(count);
+    feed.reserve(count);
+    rows.reserve(count);
+    samplers.reserve(count);
+    static const bool trace = std::getenv("GUFO_DFLASH_AR_TRACE") != nullptr;
+    for (std::size_t i = 0; i < count; ++i) {
+      auto& state = RequireMimo2State(decodes[i].state.get());
+      if (!state.speculative() || decodes[i].max_tokens == 0) {
+        return TextModelRunner::DecodeBatch(decodes);
+      }
+      states[i] = &state;
+      std::string error;
+      if (!state.SwitchToAr(&error)) {
+        if (trace) {
+          fprintf(stderr, "[DFLASH-AR] cycle stays speculative: %s\n",
+                  error.c_str());
+          fflush(stderr);
+        }
+        return TextModelRunner::DecodeBatch(decodes);
+      }
+      auto& sampler = samplers.emplace_back(decodes[i].sampler.get());
+      const auto cycle =
+          state.PrepareArCycle(decodes[i].max_tokens, sampler, steps[i]);
+      if (cycle.stopped) {
+        continue;
+      }
+      targets.push_back(&state.dflash());
+      feed.push_back(cycle.feed);
+      rows.push_back(i);
+    }
+    if (!rows.empty()) {
+      std::string error;
+      bool forwarded = false;
+      try {
+        forwarded = models::mimo2::DFlashV1Target::ForwardRowsBatch(
+            targets, feed, &error);
+      } catch (const std::exception& exception) {
+        error = exception.what();
+      }
+      if (!forwarded) {
+        for (const auto index : rows) {
+          steps[index].failure = std::make_exception_ptr(
+              std::runtime_error("MiMo DFlash batch failed: " + error));
+        }
+      } else {
+        for (const auto index : rows) {
+          try {
+            states[index]->FinishArCycle(samplers[index], steps[index]);
+          } catch (const std::exception&) {
+            steps[index].failure = std::current_exception();
+            continue;
+          }
+          if (rows.size() > 1) {
+            steps[index].execution_plan = {
+                .kind = TextExecutionPlanKind::kBatched,
+                .physical_width = rows.size(),
+            };
+          }
+        }
+        if (trace) {
+          for (const auto index : rows) {
+            const auto& state = *states[index];
+            if (!state.ArConsistent()) {
+              fprintf(stderr,
+                      "[DFLASH-AR] INVARIANT req=%zu target=%u state=%zu "
+                      "seq=%zu\n",
+                      index, state.dflash().Position(), state.position(),
+                      state.ArSequenceSize());
+            }
+          }
+          fprintf(stderr, "[DFLASH-AR] cycle rows=%zu first=%zu\n", rows.size(),
+                  rows.front());
+          fflush(stderr);
+        }
+      }
+    }
+    for (std::size_t i = 0; i < count; ++i) {
+      decodes[i].sampler.get().CopyDrawStateFrom(samplers[i]);
+    }
+    return steps;
+  }
+
+  /// `plan`, when given, fixes the batch's draft count (a TP2 peer's choice).
+  [[nodiscard]] std::vector<TextDecodeStep> RunDecodeBatch(
+      std::span<const TextRunnerDecode> decodes,
+      const std::optional<std::uint32_t>* plan) const {
+    if (decodes.size() < 2) {
+      return TextModelRunner::DecodeBatch(decodes);
+    }
+    if (use_dflash()) {
+      // A DFlash batch plans nothing (neither rank speculates here), so both
+      // ranks run the same autoregressive cycle.
+      if (plan != nullptr && plan->has_value()) {
+        return TextModelRunner::DecodeBatch(decodes);
+      }
+      return RunDflashArBatch(decodes);
+    }
+    if (!use_mtp_) {
+      return TextModelRunner::DecodeBatch(decodes);
+    }
+    for (const auto& decode : decodes) {
+      if (RequireMimo2State(decode.state.get()).speculative()) {
+        return TextModelRunner::DecodeBatch(decodes);
+      }
+    }
+    const auto count = decodes.size();
+    std::vector<sampling::SamplerState> samplers;
+    std::vector<Mimo2Session::DecodeResult> results(count);
+    std::vector<Mimo2Session::BatchOutcome> outcomes(count);
+    std::vector<Mimo2Session::SpeculativeStats> before;
+    std::vector<Mimo2Session::DecodeRequest> requests;
+    samplers.reserve(count);
+    before.reserve(count);
+    requests.reserve(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      auto& state = RequireMimo2State(decodes[i].state.get());
+      auto& session = state.session();
+      auto& sampler = samplers.emplace_back(decodes[i].sampler.get());
+      before.push_back(session.Statistics());
+      requests.push_back(
+          {&session,
+           std::min<std::size_t>(decodes[i].max_tokens,
+                                 std::uint64_t{max_draft_tokens_} + 1),
+           &sampler, &results[i], state.stop_at_eos(), &outcomes[i]});
+    }
+    std::string error;
+    (void)Mimo2Session::DecodeBatch(requests, &error, plan);
+    const auto active_count = static_cast<std::size_t>(std::count_if(
+        results.begin(), results.end(),
+        [](const auto& result) { return !result.tokens.empty(); }));
+    std::vector<TextDecodeStep> steps(count);
+    for (std::size_t i = 0; i < count; ++i) {
+      if (!outcomes[i].completed) {
+        steps[i].failure = std::make_exception_ptr(
+            std::runtime_error("MiMo MTP failed: " + outcomes[i].error));
+        continue;
+      }
+      auto& state = RequireMimo2State(decodes[i].state.get());
+      decodes[i].sampler.get().CopyDrawStateFrom(samplers[i]);
+      state.set_position(state.session().Position());
+      auto& step = steps[i];
+      step.stop = results[i].stop;
+      if (active_count > 1 && !results[i].tokens.empty()) {
+        step.execution_plan = {.kind = TextExecutionPlanKind::kBatched,
+                               .physical_width = active_count};
+      }
+      for (const auto token : results[i].tokens) {
+        step.selections.push_back({.stop = false,
+                                   .token = static_cast<TextRunnerToken>(token),
+                                   .piece = model_->TokenText(token)});
+      }
+      const auto stats = state.session().Statistics();
+      step.draft_tokens = stats.drafted - before[i].drafted;
+      step.draft_accepted_tokens = stats.accepted - before[i].accepted;
+    }
+    return steps;
+  }
+
+  [[nodiscard]] std::size_t CheckpointPosition(
+      const TextRunnerState& state) const override {
+    return RequireMimo2State(state).position();
+  }
+
+  [[nodiscard]] std::size_t SnapshotPayloadBytes(
+      const TextRunnerState& state) const override {
+    if (RequireMimo2State(state).speculative()) {
+      throw std::logic_error("MiMo DFlash sessions do not support snapshots");
+    }
+    const std::uint64_t bytes =
+        RequireMimo2State(state).session().SnapshotBytes();
+    if (bytes == 0 || bytes > static_cast<std::uint64_t>(
+                                  std::numeric_limits<std::size_t>::max())) {
+      throw std::overflow_error("MiMo snapshot size is unavailable");
+    }
+    return static_cast<std::size_t>(bytes);
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerSnapshot> Snapshot(
+      const TextRunnerState& state) const override {
+    const auto& mimo = RequireMimo2State(state);
+    if (mimo.speculative()) {
+      throw std::logic_error("MiMo DFlash sessions do not support snapshots");
+    }
+    std::string error;
+    auto snapshot = mimo.session().SaveSnapshot(&error);
+    if (snapshot == nullptr) {
+      throw std::runtime_error("MiMo snapshot failed: " + error);
+    }
+    return std::make_unique<Mimo2TextRunnerSnapshot>(
+        model_, std::move(snapshot), mimo.position());
+  }
+
+  void RestoreOrFork(TextRunnerState& state,
+                     const TextRunnerSnapshot& snapshot) const override {
+    const auto* mimo_snapshot =
+        dynamic_cast<const Mimo2TextRunnerSnapshot*>(&snapshot);
+    if (mimo_snapshot == nullptr || mimo_snapshot->model.get() != model_.get() ||
+        mimo_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument("MiMo snapshot does not belong to this model");
+    }
+    auto& restored = RequireMimo2State(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(*mimo_snapshot->snapshot, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error("MiMo snapshot restore failed: " + error);
+    }
+    restored.set_position(mimo_snapshot->position);
+  }
+
+  [[nodiscard]] std::size_t PersistentSnapshotPayloadBytes(
+      const TextRunnerSnapshot& snapshot) const override {
+    const auto* mimo_snapshot =
+        dynamic_cast<const Mimo2TextRunnerSnapshot*>(&snapshot);
+    if (mimo_snapshot == nullptr || mimo_snapshot->model.get() != model_.get() ||
+        mimo_snapshot->snapshot == nullptr) {
+      throw std::invalid_argument(
+          "MiMo persistent snapshot does not belong to this model");
+    }
+    return mimo_snapshot->PayloadBytes();
+  }
+
+  [[nodiscard]] std::size_t SerializePersistentSnapshot(
+      const TextRunnerSnapshot& snapshot,
+      std::span<std::uint8_t> destination) const override {
+    const auto* mimo_snapshot =
+        dynamic_cast<const Mimo2TextRunnerSnapshot*>(&snapshot);
+    if (mimo_snapshot == nullptr || mimo_snapshot->model.get() != model_.get() ||
+        mimo_snapshot->snapshot == nullptr ||
+        destination.size() != mimo_snapshot->PayloadBytes() ||
+        !mimo_snapshot->snapshot->CopyTo(destination)) {
+      throw std::invalid_argument(
+          "MiMo persistent snapshot serialization failed");
+    }
+    return destination.size();
+  }
+
+  void StreamPersistentSnapshot(const TextRunnerSnapshot& snapshot,
+                                const SnapshotSink& sink) const override {
+    (void)PersistentSnapshotPayloadBytes(snapshot);
+    sink(dynamic_cast<const Mimo2TextRunnerSnapshot&>(snapshot)
+             .snapshot->bytes());
+  }
+
+  void RestorePersistentSnapshot(
+      TextRunnerState& state,
+      std::span<const std::uint8_t> payload) const override {
+    // Under TP2 a payload is this rank's half, which the identity names.
+    auto& restored = RequireMimo2State(state);
+    std::string error;
+    if (!restored.session().RestoreSnapshot(payload, &error)) {
+      restored.Invalidate();
+      throw std::runtime_error(
+          "MiMo persistent snapshot restore failed: " + error);
+    }
+    const std::uint32_t position = restored.session().Position();
+    if (position == 0 || position > max_context_) {
+      restored.Invalidate();
+      throw std::runtime_error(
+          "MiMo persistent snapshot restored an invalid position");
+    }
+    restored.set_position(position);
+  }
+
+private:
+  [[nodiscard]] bool use_dflash() const noexcept {
+    return dflash_model_ != nullptr;
+  }
+
+  std::shared_ptr<Mimo2Model> model_;
+  std::uint32_t max_context_;
+  bool use_mtp_;
+  std::uint32_t max_draft_tokens_;
+  std::shared_ptr<const models::mimo2::DFlashV1Model> dflash_model_;
+  std::uint32_t dflash_max_draft_tokens_{7};
+  bool distributed_{false};
+  std::optional<TextRunnerPersistenceDescriptor> persistence_;
 };
 #endif
 
@@ -3075,11 +4803,108 @@ struct InferenceBackend::Impl {
 #if defined(ENGINE_ENABLE_HIP)
   struct State {
     std::shared_ptr<TextGenerationScheduler> scheduler;
+    /// Rank 0 of a TP2 pair: the runner that sends rank 1 each model call.
+    std::shared_ptr<TpMirroredRunner> tp_runner;
+    /// Rank 1 of a TP2 pair: executes rank 0's model calls. Rank 1 serves no
+    /// requests of its own, so it has no scheduler.
+    std::shared_ptr<TpExecutor> tp_executor;
+    std::shared_ptr<TpControlChannel> control;
+    std::shared_ptr<TpResponseBroker> response_broker;
+    std::shared_ptr<models::qwen38_flash_next::rocm::Communicator> communicator;
+    /// Set when the serve CLI built the native mimo2 transport for a MiMo
+    /// TP2 pair (the graph-capture-capable one; `communicator` stays null).
+    std::shared_ptr<models::mimo2::rocm::Communicator> mimo2_communicator;
+    std::uint32_t tp_rank{0};
+    std::uint32_t tp_world_size{1};
     std::string model_id;
     SamplingDefaults sampling_defaults;
     std::uint32_t max_context{0};
     bool supports_images{false};
     ReasoningOptions reasoning_defaults;
+    /// TP2: how many requests may be open at once, running or waiting.
+    std::size_t tp_max_requests{0};
+  };
+
+  /// One TP2 request on rank 0, from the command that opens it on rank 1 to
+  /// rank 1's verdict. Requests run concurrently: each model call names its
+  /// request, so rank 1 keeps every open request apart.
+  class TpRequest {
+  public:
+    TpRequest(std::shared_ptr<const State> state,
+              std::shared_ptr<std::atomic<std::size_t>> open,
+              std::uint64_t sequence)
+        : state_(std::move(state)),
+          open_(std::move(open)),
+          sequence_(sequence) {}
+
+    TpRequest(const TpRequest&) = delete;
+    TpRequest& operator=(const TpRequest&) = delete;
+
+    [[nodiscard]] bool finished() const noexcept { return finished_; }
+
+    /// Ends the request on rank 1 (`kEnd` with rank 0's instruction count and
+    /// digest) and collects rank 1's verdict, and the verdicts on any state
+    /// the request reused before they arrived. Call once rank 0 makes no
+    /// further model calls for the request. Returns the first problem, or an
+    /// empty string when both ranks agree.
+    [[nodiscard]] std::string Finish() noexcept {
+      if (finished_) {
+        return {};
+      }
+      finished_ = true;
+      std::string problem;
+      bool settled = false;
+      try {
+        const auto note = [&](std::string message) {
+          if (problem.empty()) {
+            problem = std::move(message);
+          }
+        };
+        std::string error;
+        if (!state_->tp_runner->EndRequest(sequence_, &error)) {
+          note(error);
+          state_->response_broker->FailAll("TP request end failed: " + error);
+        } else {
+          TpControlResponse response;
+          if (!state_->response_broker->WaitForResponse(sequence_, &response,
+                                                        &error)) {
+            note("TP worker response failed: " + error);
+          } else if (!response.error.empty()) {
+            note("TP worker failed: " + response.error);
+          }
+        }
+        if (!state_->tp_runner->AwaitDependencies(sequence_)) {
+          note("TP request reused a state rank 1 rejected");
+        }
+        // A request the ranks disagree about leaves a state that may differ
+        // between them; it is never reused, and the cache replaces it in
+        // time. Other requests keep theirs.
+        state_->tp_runner->Settle(sequence_, problem.empty());
+        settled = true;
+      } catch (...) {
+        try {
+          if (problem.empty()) {
+            problem = "TP request end failed";
+          }
+        } catch (...) {
+        }
+      }
+      if (!settled) {
+        // Requests that reused this one's state wait for its verdict.
+        try {
+          state_->tp_runner->Settle(sequence_, false);
+        } catch (...) {
+        }
+      }
+      open_->fetch_sub(1);
+      return problem;
+    }
+
+  private:
+    std::shared_ptr<const State> state_;
+    std::shared_ptr<std::atomic<std::size_t>> open_;
+    std::uint64_t sequence_{0};
+    bool finished_{false};
   };
 
   class ScheduledGenerationRequest final : public GenerationRequest {
@@ -3088,18 +4913,50 @@ struct InferenceBackend::Impl {
         std::shared_ptr<const State> model_state,
         TextGenerationScheduler::Request scheduled_request,
         InitialOutputState initial = InitialOutputState::kContent,
+        std::unique_ptr<TpRequest> tp = {},
         std::optional<sampling::JsonConstraint::ToolFormat> tool_format = {})
         : state_(std::move(model_state)),
           request_(std::move(scheduled_request)),
+          tp_(std::move(tp)),
           tool_format_(tool_format) {
       if (initial == InitialOutputState::kReasoning)
         reasoning_end_ = state_->scheduler->runner().Tokenize("</think>");
     }
 
+    ~ScheduledGenerationRequest() override {
+      // A TP2 request whose result was never collected must still end on rank
+      // 1, which otherwise keeps waiting for its next model call.
+      if (tp_ != nullptr && !tp_->finished()) {
+        request_.Cancel();
+        try {
+          (void)request_.Wait({});
+        } catch (...) {
+        }
+        (void)tp_->Finish();
+      }
+    }
+
     Result Wait(const TokenCallback& on_token,
                 const ProgressCallback& on_progress,
                 const StartCallback& on_start) override {
-      auto result = request_.Wait(on_token, on_progress, on_start);
+      std::exception_ptr local_error;
+      Result result;
+      try {
+        result = request_.Wait(on_token, on_progress, on_start);
+      } catch (...) {
+        local_error = std::current_exception();
+      }
+      if (tp_ != nullptr) {
+        // Rank 0 makes no further model calls for the request once its own
+        // wait returns, so the request can end on rank 1 too.
+        const auto problem = tp_->Finish();
+        if (local_error == nullptr && !problem.empty()) {
+          throw std::runtime_error(problem);
+        }
+      }
+      if (local_error != nullptr) {
+        std::rethrow_exception(local_error);
+      }
       if (!reasoning_end_.empty()) {
         const auto end =
             std::search(result.tokens.begin(), result.tokens.end(),
@@ -3110,6 +4967,8 @@ struct InferenceBackend::Impl {
       return result;
     }
 
+    /// Never blocks: it may run inside `Wait`'s token callback. The scheduler
+    /// stops the request between model calls, and `Wait` then ends it.
     void Cancel() noexcept override { request_.Cancel(); }
 
     std::optional<sampling::JsonConstraint::ToolFormat> ToolFormat()
@@ -3121,12 +4980,125 @@ struct InferenceBackend::Impl {
     std::shared_ptr<const State> state_;
     TextGenerationScheduler::Request request_;
     std::vector<tokenization::TokenId> reasoning_end_;
+    std::unique_ptr<TpRequest> tp_;
     const std::optional<sampling::JsonConstraint::ToolFormat> tool_format_;
   };
 
   [[nodiscard]] std::shared_ptr<const State> Snapshot() const {
     const std::lock_guard<std::mutex> lock(state_mutex);
     return state;
+  }
+
+  /// Starts a TP2 request on rank 0: tells rank 1 about it, then submits it to
+  /// the scheduler, whose model calls the mirrored runner sends to rank 1.
+  /// The scheduler decides everything else -- sampling, stop sequences,
+  /// cancellation between model calls, streaming -- exactly as on one host.
+  [[nodiscard]] std::shared_ptr<ScheduledGenerationRequest> StartTpRequest(
+      const std::shared_ptr<const State>& state,
+      std::vector<TextRunnerToken> prompt, std::size_t max_tokens,
+      const sampling::SamplingConfig& sampling,
+      const CancellationCheck& is_cancelled, bool stream_output,
+      const std::string& client_id, std::vector<std::string> stop_sequences,
+      InitialOutputState initial, Clock::time_point request_start,
+      bool cache_prompt, std::size_t cache_prefix_tokens,
+      std::shared_ptr<const TextPromptContext> context) const {
+    if (state->tp_runner == nullptr || state->response_broker == nullptr ||
+        (state->communicator == nullptr &&
+         state->mimo2_communicator == nullptr) ||
+        state->scheduler == nullptr) {
+      throw std::logic_error("TP2 rank 0 is not fully configured");
+    }
+    // The scheduler would refuse these too, but only after rank 1 was told
+    // about the request, and a refused command is a failed request rather than
+    // a client error.
+    if (prompt.size() >= state->max_context) {
+      throw std::length_error(
+          "prompt has " + std::to_string(prompt.size()) +
+          " tokens but the context is " + std::to_string(state->max_context) +
+          "; increase --context or shorten the conversation");
+    }
+    // Resolve the budget as the scheduler does, so rank 1 is told the one
+    // rank 0 uses: zero, a request without `max_tokens`, means "until the
+    // context is full".
+    const std::size_t available = state->max_context - prompt.size();
+    if (max_tokens == 0 || max_tokens > available) {
+      max_tokens = available;
+    }
+    if (max_tokens > std::numeric_limits<std::uint32_t>::max()) {
+      throw std::invalid_argument(
+          "TP2 token budget exceeds the protocol range");
+    }
+    if (cache_prefix_tokens > prompt.size()) {
+      throw std::invalid_argument("TP cache prefix exceeds request prompt");
+    }
+    cache_prompt = cache_prompt &&
+                   state->tp_runner->Descriptor().capabilities.prefix_reuse;
+    TpControlCommand begin{
+        .max_tokens = static_cast<std::uint32_t>(max_tokens),
+        .cache_prompt = cache_prompt,
+        .cache_prefix_tokens = static_cast<std::uint32_t>(cache_prefix_tokens),
+        .client_id = client_id,
+        .sampling = sampling,
+    };
+    if (context != nullptr) {
+      begin.prompt_context = state->tp_runner->EncodePromptContext(*context);
+    }
+    begin.prompt_tokens.reserve(prompt.size());
+    for (const auto token : prompt) {
+      if (token > static_cast<TextRunnerToken>(
+                      std::numeric_limits<std::int32_t>::max())) {
+        throw std::invalid_argument(
+            "TP2 prompt token exceeds the protocol range");
+      }
+      begin.prompt_tokens.push_back(static_cast<std::int32_t>(token));
+    }
+    // Bounded like the scheduler's queue plus its running requests, so the
+    // response broker always has room for the verdict.
+    if (tp_open->fetch_add(1) >= state->tp_max_requests) {
+      tp_open->fetch_sub(1);
+      throw TextGenerationError(TextGenerationErrorCode::kQueueFull,
+                                "text generation pending queue is full");
+    }
+    begin.sequence = tp_sequence.fetch_add(1);
+    std::string error;
+    if (!state->response_broker->RegisterPendingResponse(begin.sequence,
+                                                         &error)) {
+      tp_open->fetch_sub(1);
+      throw std::runtime_error("TP response registration failed: " + error);
+    }
+    // Rank 1 must know the request before its first model call, and rank 0's
+    // runner before the scheduler can lease it a state. The channel keeps
+    // order, so the command reaches rank 1 before any call for the request.
+    if (!state->control->SendCommand(begin, &error)) {
+      std::string cancel_error;
+      (void)state->response_broker->CancelUnsentResponse(begin.sequence,
+                                                         &cancel_error);
+      tp_open->fetch_sub(1);
+      throw std::runtime_error("TP worker command failed: " + error);
+    }
+    state->tp_runner->BeginRequest(begin.sequence);
+    auto tp = std::make_unique<TpRequest>(state, tp_open, begin.sequence);
+    try {
+      auto scheduled = state->scheduler->Submit(
+          std::move(prompt), max_tokens, sampling, is_cancelled, stream_output,
+          TextRequestMetadata{
+              .client_id = client_id,
+              .deadline = std::nullopt,
+              .request_start = request_start,
+              .prompt_context = std::make_shared<TpRequestContext>(
+                  begin.sequence, std::move(context)),
+              .cache_prompt = cache_prompt,
+              .cache_prefix_tokens = cache_prefix_tokens,
+              .stop_sequences = std::move(stop_sequences),
+          });
+      return std::make_shared<ScheduledGenerationRequest>(
+          state, std::move(scheduled), initial, std::move(tp));
+    } catch (...) {
+      // Rank 0 made no model call for the request, so it ends on rank 1 with
+      // none either.
+      (void)tp->Finish();
+      throw;
+    }
   }
 
   Result GenerateScheduled(
@@ -3151,6 +5123,14 @@ struct InferenceBackend::Impl {
       return result;
     }
 
+    if (current->control != nullptr) {
+      auto generation = StartTpRequest(
+          current, std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
+          static_cast<bool>(on_token), client_id, stop_sequences, initial,
+          request_start, cache_prompt, cache_prefix_tokens, std::move(context));
+      return generation->Wait(on_token, {}, {});
+    }
+
     auto request = current->scheduler->Submit(
         std::move(prompt_tokens), max_tokens, sampling, is_cancelled,
         static_cast<bool>(on_token),
@@ -3169,6 +5149,11 @@ struct InferenceBackend::Impl {
   }
 
   mutable std::mutex state_mutex;
+  /// TP2 requests between their command to rank 1 and its verdict.
+  mutable std::shared_ptr<std::atomic<std::size_t>> tp_open{
+      std::make_shared<std::atomic<std::size_t>>(0)};
+  /// Starts at 1: zero means "no single request" to the instruction protocol.
+  mutable std::atomic<std::uint64_t> tp_sequence{1};
   std::shared_ptr<const State> state;
 #endif
 };
@@ -3185,6 +5170,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                             const TextSpeculativeConfig& speculative_config,
                             const TextDiskCacheConfig& disk_cache_config,
                             const std::string& vision_model_path,
+                            const TextTpConfig& tp_config,
                             TextRunnerRamCacheOptions ram_cache_config) {
 #if defined(ENGINE_ENABLE_HIP)
   TextDiskCacheConfig resolved_disk_cache_config = disk_cache_config;
@@ -3195,12 +5181,18 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     return false;
   }
   const std::shared_ptr<const core::GgufReader> reader(std::move(reader_owner));
+  const std::string architecture =
+      std::string(reader->GetMetadataString("general.architecture")
+                      .value_or(std::string_view{}));
+  if (tp_config.world_size > 1 && architecture != "qwen4exp" &&
+      architecture != "mimo2") {
+    SetError(error,
+             "HTTP TP=2 is supported only by Qwen3.8-Flash-Next and MiMo");
+    return false;
+  }
   if (max_context == 0) {
-    const auto architecture =
-        reader->GetMetadataString("general.architecture").value_or("");
     const auto native =
-        reader->GetMetadataUint64(std::string(architecture) + ".context_length")
-            .value_or(0);
+        reader->GetMetadataUint64(architecture + ".context_length").value_or(0);
     if (native < 2 || native > std::numeric_limits<std::uint32_t>::max()) {
       SetError(error,
                "GGUF has no valid native context length; specify --context");
@@ -3209,7 +5201,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     max_context = static_cast<std::uint32_t>(native);
   }
 
-  if (reader->GetMetadataString("general.architecture") == "deepseek4") {
+  if (architecture == "deepseek4") {
     if (!vision_model_path.empty()) {
       SetError(error, "DeepSeek does not support --mmproj");
       return false;
@@ -3264,7 +5256,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
                 prefill_policy, scheduler_policy, speculative_config,
                 std::move(resolved_disk_cache_config), ram_cache_config);
   }
-  if (reader->GetMetadataString("general.architecture") == "qwen4exp") {
+  if (architecture == "qwen4exp") {
     if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
         speculative_config.backend != TextSpeculativeBackend::kMtp) {
       SetError(error,
@@ -3307,6 +5299,10 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
             .vision_model_path = vision_model_path,
             .decode_concurrency = static_cast<std::uint32_t>(
                 std::clamp<std::size_t>(session_count, 1, 8)),
+            .tp_rank = tp_config.rank,
+            .tp_world_size = tp_config.world_size,
+            .hip_device = tp_config.hip_device,
+            .communicator = tp_config.communicator,
         },
         &load_error);
     if (model == nullptr) {
@@ -3330,7 +5326,100 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), ram_cache_config);
+                std::move(resolved_disk_cache_config), tp_config,
+                ram_cache_config);
+  }
+  if (architecture == "mimo2") {
+    if (!vision_model_path.empty()) {
+      SetError(error, "MiMo does not support --mmproj");
+      return false;
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        speculative_config.backend != TextSpeculativeBackend::kMtp &&
+        speculative_config.backend != TextSpeculativeBackend::kDFlash) {
+      SetError(error,
+               "MiMo HTTP models support MTP or DFlash speculative decoding "
+               "(--speculative mtp --mtp-model / --speculative dflash2 "
+               "--dflash-model)");
+      return false;
+    }
+    if ((speculative_config.backend == TextSpeculativeBackend::kMtp ||
+         speculative_config.backend == TextSpeculativeBackend::kDFlash) &&
+        speculative_config.draft_model_path.empty()) {
+      SetError(error, "MiMo speculative decoding requires a draft sidecar");
+      return false;
+    }
+    if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+        (speculative_config.max_draft_tokens == 0 ||
+         speculative_config.min_draft_tokens != 1)) {
+      SetError(error,
+               "MiMo speculative decoding requires a positive draft limit "
+               "and --min-draft-tokens 1");
+      return false;
+    }
+    // The compiled MiMo chat template renders through the artifact's own
+    // tokenizer (the same vocabulary and pre-tokenizer as MiMo-V2).
+    if (!models::mimo2::ValidateGgufTemplate(*reader, &load_error)) {
+      SetError(error, "Unsupported MiMo chat template: " + load_error);
+      return false;
+    }
+    // The serve CLI owns one qwen38-typed communicator per TP2 pair; the
+    // mimo2 engine takes its own (identical) interface. A MiMo pair that
+    // built the native mimo2 transport hands it over directly — it carries
+    // the graph-capture exchange protocol the adapter cannot forward.
+    std::shared_ptr<models::mimo2::rocm::Communicator> mimo2_communicator;
+    if (tp_config.mimo2_communicator != nullptr) {
+      mimo2_communicator = tp_config.mimo2_communicator;
+    } else if (tp_config.communicator != nullptr) {
+      mimo2_communicator =
+          std::make_shared<Mimo2CommunicatorAdapter>(tp_config.communicator);
+    }
+    // The model owns prefill geometry for both bulk and scheduled requests.
+    auto model = models::mimo2::Model::Load(
+        model_path,
+        models::mimo2::ModelOptions{
+            .max_context = max_context,
+            .mtp_model_path =
+                speculative_config.backend == TextSpeculativeBackend::kMtp
+                    ? speculative_config.draft_model_path
+                    : std::string{},
+            .dflash_model_path =
+                speculative_config.backend == TextSpeculativeBackend::kDFlash
+                    ? speculative_config.draft_model_path
+                    : std::string{},
+            .dflash_max_draft_tokens = speculative_config.max_draft_tokens,
+            .max_draft_tokens = speculative_config.max_draft_tokens,
+            .decode_concurrency = static_cast<std::uint32_t>(
+                std::clamp<std::size_t>(session_count, 1, 8)),
+            .tp_rank = tp_config.rank,
+            .tp_world_size = tp_config.world_size,
+            .hip_device = tp_config.hip_device,
+            .communicator = mimo2_communicator,
+        },
+        &load_error);
+    if (model == nullptr) {
+      SetError(error, "Failed to create MiMo model: " + load_error);
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        resolved_disk_cache_config.model_artifact_fingerprint.empty() &&
+        !FingerprintArtifact(
+            "MiMo-V2.6-Flash", *reader,
+            &resolved_disk_cache_config.model_artifact_fingerprint, error)) {
+      return false;
+    }
+    if (DiskCacheEnabled(resolved_disk_cache_config) &&
+        speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        resolved_disk_cache_config.draft_model_artifact_fingerprint.empty() &&
+        !FingerprintArtifactFile(
+            "MiMo-V2.6-Flash MTP", speculative_config.draft_model_path,
+            &resolved_disk_cache_config.draft_model_artifact_fingerprint,
+            error)) {
+      return false;
+    }
+    return load(std::move(model), error, max_context, session_count,
+                prefill_policy, scheduler_policy, speculative_config,
+                std::move(resolved_disk_cache_config), tp_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -3372,6 +5461,7 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
   (void)speculative_config;
   (void)disk_cache_config;
   (void)vision_model_path;
+  (void)tp_config;
   (void)ram_cache_config;
   SetError(error, "HTTP inference requires the HIP backend");
   return false;
@@ -3614,7 +5704,7 @@ bool InferenceBackend::load(
     std::uint32_t max_context, std::size_t session_count,
     TextPrefillPolicy prefill_policy, TextSchedulerPolicy scheduler_policy,
     TextSpeculativeConfig speculative_config,
-    TextDiskCacheConfig disk_cache_config,
+    TextDiskCacheConfig disk_cache_config, const TextTpConfig& tp_config,
     TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "Qwen3.8-Flash-Next model must not be null");
@@ -3623,6 +5713,13 @@ bool InferenceBackend::load(
   if (max_context == 0)
     max_context = model->MaxContext();
 
+  if (model->TpWorldSize() > 1 &&
+      (tp_config.control == nullptr || tp_config.communicator == nullptr)) {
+    SetError(error,
+             "Qwen3.8-Flash-Next TP2 requires a worker control channel "
+             "and communicator");
+    return false;
+  }
   if (session_count == 0) {
     SetError(error, "HTTP session count must be at least one");
     return false;
@@ -3631,6 +5728,11 @@ bool InferenceBackend::load(
     SetError(
         error,
         "HTTP context exceeds the loaded Qwen3.8-Flash-Next model context");
+    return false;
+  }
+  if (prefill_policy.decode_active_tokens >
+      std::numeric_limits<std::uint32_t>::max()) {
+    SetError(error, "HTTP prefill chunk exceeds the TP control range");
     return false;
   }
   if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
@@ -3658,6 +5760,10 @@ bool InferenceBackend::load(
              "invalid");
     return false;
   }
+  const auto tp_world_size = model->TpWorldSize();
+  const auto tp_rank = model->TpRank();
+  const bool has_mtp = model->HasMtp();
+  const bool has_vision = model->VisionEncoder() != nullptr;
   try {
     auto new_state = std::make_shared<Impl::State>();
     new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
@@ -3671,19 +5777,94 @@ bool InferenceBackend::load(
         disk_cache_config.draft_model_artifact_fingerprint);
     new_state->model_id = runner->Descriptor().model_id;
     new_state->max_context = max_context;
-    std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
-    if (DiskCacheEnabled(disk_cache_config)) {
-      runner_disk_cache = TextRunnerDiskCacheOptions{
-          .directory = std::move(disk_cache_config.directory),
-          .capacity_bytes = disk_cache_config.capacity_bytes,
-          .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+    new_state->tp_max_requests =
+        session_count + scheduler_policy.max_pending_requests;
+    if (tp_world_size > 1) {
+      const TpControlConfig control_config{
+          .snapshot_budget_bytes = HostSnapshotBudgetBytes(),
+          .rank = tp_rank,
+          .world_size = tp_world_size,
+          .max_context = max_context,
+          .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
+          .use_mtp = has_mtp,
+          .auth_token = tp_config.auth_token,
+          .prefill_chunk_tokens =
+              static_cast<std::uint32_t>(prefill_policy.decode_active_tokens),
+          .sessions = static_cast<std::uint32_t>(session_count),
+          .vision = has_vision,
+          .disk_cache = DiskCacheEnabled(disk_cache_config),
       };
+      std::string control_error;
+      if (!tp_config.control->Handshake(control_config, &control_error)) {
+        SetError(error, "TP worker handshake failed: " + control_error);
+        return false;
+      }
+      if (tp_rank == 0) {
+        new_state->response_broker = std::make_shared<TpResponseBroker>(
+            tp_config.control, new_state->tp_max_requests);
+      }
     }
-    auto runner_pool = std::make_shared<TextRunnerPool>(
-        std::move(runner), session_count, std::move(runner_disk_cache),
-        ram_cache_config);
-    new_state->scheduler = std::make_shared<TextGenerationScheduler>(
-        std::move(runner_pool), prefill_policy, scheduler_policy);
+    if (tp_world_size > 1 && tp_rank != 0) {
+      // Rank 1 serves nothing itself: it executes rank 0's model calls on as
+      // many states as rank 0's pool creates, and builds no pool of its own.
+      // Its disk cache holds its half of what rank 0's cache saves.
+      std::shared_ptr<TpDiskStore> disk;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        const auto persistence = runner->Descriptor().persistence;
+        if (!persistence.has_value()) {
+          SetError(error, "TP worker disk cache needs model fingerprints");
+          return false;
+        }
+        const std::size_t staging =
+            disk_cache_config.staging_capacity_bytes != 0
+                ? disk_cache_config.staging_capacity_bytes
+                : std::min(
+                      disk_cache_config.capacity_bytes,
+                      TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes);
+        disk = std::make_shared<TpDiskStore>(
+            TpDiskStore::Options{
+                .directory = disk_cache_config.directory,
+                .capacity_bytes = disk_cache_config.capacity_bytes,
+                .staging_capacity_bytes = staging,
+            },
+            persistence->compatibility_identity, persistence->payload_version);
+      }
+      new_state->tp_executor = std::make_shared<TpExecutor>(
+          std::move(runner), session_count,
+          tp_config.control->snapshot_budget_bytes(),
+          MakeTpCallScope(tp_config),
+          std::move(disk));
+    } else {
+      std::shared_ptr<TextModelRunner> pool_runner = runner;
+      if (tp_world_size > 1) {
+        new_state->tp_runner = std::make_shared<TpMirroredRunner>(
+            std::move(runner),
+            std::make_shared<TpControlInstructionSink>(
+                tp_config.control, new_state->response_broker),
+            tp_config.control->snapshot_budget_bytes(),
+            MakeTpCallScope(tp_config));
+        pool_runner = new_state->tp_runner;
+      }
+      std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        runner_disk_cache = TextRunnerDiskCacheOptions{
+            .directory = std::move(disk_cache_config.directory),
+            .capacity_bytes = disk_cache_config.capacity_bytes,
+            .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+        };
+      }
+      auto runner_pool = std::make_shared<TextRunnerPool>(
+          std::move(pool_runner), session_count, std::move(runner_disk_cache),
+          ram_cache_config);
+      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+          std::move(runner_pool), prefill_policy, scheduler_policy);
+    }
+    new_state->control = tp_config.control;
+    new_state->communicator = tp_config.communicator;
+    new_state->mimo2_communicator = tp_config.mimo2_communicator;
+    new_state->tp_rank = tp_rank;
+    new_state->tp_world_size = tp_world_size;
+
     {
       const std::lock_guard<std::mutex> lock(impl_->state_mutex);
       impl_->state = std::move(new_state);
@@ -3693,6 +5874,245 @@ bool InferenceBackend::load(
     SetError(error, exception.what());
     return false;
   }
+}
+
+bool InferenceBackend::load(std::shared_ptr<models::mimo2::Model> model,
+                            std::string* error, std::uint32_t max_context,
+                            std::size_t session_count,
+                            TextPrefillPolicy prefill_policy,
+                            TextSchedulerPolicy scheduler_policy,
+                            TextSpeculativeConfig speculative_config,
+                            TextDiskCacheConfig disk_cache_config,
+                            const TextTpConfig& tp_config) {
+  if (model == nullptr) {
+    SetError(error, "MiMo model must not be null");
+    return false;
+  }
+  if (max_context == 0)
+    max_context = model->MaxContext();
+
+  if (model->TpWorldSize() > 1 &&
+      (tp_config.control == nullptr ||
+       (tp_config.communicator == nullptr &&
+        tp_config.mimo2_communicator == nullptr))) {
+    SetError(error,
+             "MiMo TP2 requires a worker control channel and communicator");
+    return false;
+  }
+  if (session_count == 0) {
+    SetError(error, "HTTP session count must be at least one");
+    return false;
+  }
+  if (max_context == 0 || max_context > model->MaxContext()) {
+    SetError(error, "HTTP context exceeds the loaded MiMo model context");
+    return false;
+  }
+  if (prefill_policy.decode_active_tokens >
+      std::numeric_limits<std::uint32_t>::max()) {
+    SetError(error, "HTTP prefill chunk exceeds the TP control range");
+    return false;
+  }
+  if (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+      !model->HasMtp()) {
+    SetError(error,
+             "MiMo MTP requires a model loaded with its MTP sidecar");
+    return false;
+  }
+  if (speculative_config.backend == TextSpeculativeBackend::kDFlash &&
+      model->DFlashModelPath().empty()) {
+    SetError(error,
+             "MiMo DFlash requires a model loaded with --dflash-model");
+    return false;
+  }
+  if (speculative_config.backend != TextSpeculativeBackend::kDisabled &&
+      (speculative_config.max_draft_tokens == 0 ||
+       speculative_config.min_draft_tokens != 1)) {
+    SetError(error,
+             "MiMo speculative decoding drafts a fixed chain; custom draft "
+             "floors are unsupported");
+    return false;
+  }
+  if (DiskCacheEnabled(disk_cache_config) &&
+      (!IsSha256Hex(disk_cache_config.model_artifact_fingerprint) ||
+       (speculative_config.backend == TextSpeculativeBackend::kMtp &&
+        !IsSha256Hex(disk_cache_config.draft_model_artifact_fingerprint)) ||
+       disk_cache_config.capacity_bytes == 0)) {
+    SetError(error, "MiMo persistent disk cache configuration is invalid");
+    return false;
+  }
+  const auto tp_world_size = model->TpWorldSize();
+  const auto tp_rank = model->TpRank();
+  const bool has_mtp = model->HasMtp();
+  try {
+    auto new_state = std::make_shared<Impl::State>();
+    // MiMo ships a Qwen2-family tokenizer; the Qwen3.8 sampling defaults are
+    // the closest preset until a MiMo entry exists.
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
+    new_state->sampling_defaults.supplied = {};
+    std::shared_ptr<const models::mimo2::DFlashV1Model> dflash_model;
+    if (speculative_config.backend == TextSpeculativeBackend::kDFlash) {
+      const auto heads = model->HeadTensors();
+      const models::mimo2::DFlashV1TrunkTensors trunk{
+          .token_embedding = heads.token_embedding,
+          .token_embedding_type = heads.token_embedding_type,
+          .output = heads.output,
+          .output_type = heads.output_type,
+      };
+      std::string dflash_error;
+      dflash_model = models::mimo2::DFlashV1Model::Load(
+          model->DFlashModelPath(), trunk, model->config().hidden_size,
+          model->VocabSize(), model->config().value_scale, &dflash_error);
+      if (dflash_model == nullptr) {
+        SetError(error,
+                 "Failed to load MiMo DFlash sidecar: " + dflash_error);
+        return false;
+      }
+      Logger::Info("loader",
+                   "event=dflash_sidecar weights_mib=" +
+                       std::to_string(dflash_model->weight_bytes() /
+                                      (1024 * 1024)) +
+                       " " + Logger::MemoryStatus());
+    }
+    auto runner = std::make_shared<Mimo2TextRunner>(
+        std::move(model), max_context,
+        speculative_config.backend == TextSpeculativeBackend::kMtp,
+        speculative_config.max_draft_tokens,
+        disk_cache_config.model_artifact_fingerprint,
+        disk_cache_config.draft_model_artifact_fingerprint,
+        std::move(dflash_model),
+        speculative_config.max_draft_tokens);
+    new_state->model_id = runner->Descriptor().model_id;
+    new_state->max_context = max_context;
+    new_state->tp_max_requests =
+        session_count + scheduler_policy.max_pending_requests;
+    if (tp_world_size > 1) {
+      const TpControlConfig control_config{
+          .snapshot_budget_bytes = HostSnapshotBudgetBytes(),
+          .rank = tp_rank,
+          .world_size = tp_world_size,
+          .max_context = max_context,
+          .max_draft_tokens = has_mtp ? speculative_config.max_draft_tokens : 0,
+          .use_mtp = has_mtp,
+          .auth_token = tp_config.auth_token,
+          .prefill_chunk_tokens =
+              static_cast<std::uint32_t>(prefill_policy.decode_active_tokens),
+          .sessions = static_cast<std::uint32_t>(session_count),
+          .vision = false,
+          .disk_cache = DiskCacheEnabled(disk_cache_config),
+      };
+      std::string control_error;
+      if (!tp_config.control->Handshake(control_config, &control_error)) {
+        SetError(error, "TP worker handshake failed: " + control_error);
+        return false;
+      }
+      if (tp_rank == 0) {
+        new_state->response_broker = std::make_shared<TpResponseBroker>(
+            tp_config.control, new_state->tp_max_requests);
+      }
+    }
+    if (tp_world_size > 1 && tp_rank != 0) {
+      // Rank 1 serves nothing itself: it executes rank 0's model calls on as
+      // many states as rank 0's pool creates, and builds no pool of its own.
+      // Its disk cache holds its half of what rank 0's cache saves.
+      std::shared_ptr<TpDiskStore> disk;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        const auto persistence = runner->Descriptor().persistence;
+        if (!persistence.has_value()) {
+          SetError(error, "TP worker disk cache needs model fingerprints");
+          return false;
+        }
+        const std::size_t staging =
+            disk_cache_config.staging_capacity_bytes != 0
+                ? disk_cache_config.staging_capacity_bytes
+                : std::min(
+                      disk_cache_config.capacity_bytes,
+                      TextRunnerDiskCacheOptions::kAutomaticStagingMaxBytes);
+        disk = std::make_shared<TpDiskStore>(
+            TpDiskStore::Options{
+                .directory = disk_cache_config.directory,
+                .capacity_bytes = disk_cache_config.capacity_bytes,
+                .staging_capacity_bytes = staging,
+            },
+            persistence->compatibility_identity, persistence->payload_version);
+      }
+      new_state->tp_executor = std::make_shared<TpExecutor>(
+          std::move(runner), session_count,
+          tp_config.control->snapshot_budget_bytes(),
+          MakeTpCallScope(tp_config),
+          std::move(disk));
+    } else {
+      std::shared_ptr<TextModelRunner> pool_runner = runner;
+      if (tp_world_size > 1) {
+        new_state->tp_runner = std::make_shared<TpMirroredRunner>(
+            std::move(runner),
+            std::make_shared<TpControlInstructionSink>(
+                tp_config.control, new_state->response_broker),
+            tp_config.control->snapshot_budget_bytes(),
+            MakeTpCallScope(tp_config));
+        pool_runner = new_state->tp_runner;
+      }
+      std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
+      if (DiskCacheEnabled(disk_cache_config)) {
+        runner_disk_cache = TextRunnerDiskCacheOptions{
+            .directory = std::move(disk_cache_config.directory),
+            .capacity_bytes = disk_cache_config.capacity_bytes,
+            .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+        };
+      }
+      auto runner_pool = std::make_shared<TextRunnerPool>(
+          std::move(pool_runner), session_count, std::move(runner_disk_cache));
+      new_state->scheduler = std::make_shared<TextGenerationScheduler>(
+          std::move(runner_pool), prefill_policy, scheduler_policy);
+    }
+    new_state->control = tp_config.control;
+    new_state->communicator = tp_config.communicator;
+    new_state->mimo2_communicator = tp_config.mimo2_communicator;
+    new_state->tp_rank = tp_rank;
+    new_state->tp_world_size = tp_world_size;
+
+    {
+      const std::lock_guard<std::mutex> lock(impl_->state_mutex);
+      impl_->state = std::move(new_state);
+    }
+    return true;
+  } catch (const std::exception& exception) {
+    SetError(error, exception.what());
+    return false;
+  }
+}
+
+bool InferenceBackend::run_worker(std::string* error) {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->control == nullptr ||
+      (state->communicator == nullptr &&
+       state->mimo2_communicator == nullptr) ||
+      state->tp_executor == nullptr ||
+      state->tp_world_size != 2 || state->tp_rank != 1) {
+    SetError(error, "TP worker requires a loaded rank-1 Flash-Next model");
+    return false;
+  }
+  const auto respond = [control = state->control](
+                           const TpControlResponse& response,
+                           std::string* respond_error) {
+    return control->SendResponse(response, respond_error);
+  };
+  for (;;) {
+    TpControlCommand command;
+    std::string control_error;
+    if (!state->control->ReceiveCommand(&command, &control_error)) {
+      SetError(error, "TP worker command receive failed: " + control_error);
+      return false;
+    }
+    if (!state->tp_executor->Execute(command, respond, &control_error)) {
+      SetError(error, "TP worker: " + control_error);
+      return false;
+    }
+  }
+#else
+  SetError(error, "TP worker requires the HIP backend");
+  return false;
+#endif
 }
 #endif
 
@@ -3707,12 +6127,27 @@ std::string InferenceBackend::model_id() const {
 
 bool InferenceBackend::ready() const {
 #if defined(ENGINE_ENABLE_HIP)
-  return impl_->Snapshot() != nullptr;
+  return impl_->Snapshot() != nullptr && tp_failure().empty();
 #else
   return false;
 #endif
 }
 
+std::string InferenceBackend::tp_failure() const {
+#if defined(ENGINE_ENABLE_HIP)
+  const auto state = impl_->Snapshot();
+  if (state == nullptr || state->tp_runner == nullptr) {
+    return {};
+  }
+  auto failure = state->tp_runner->Failure();
+  if (failure.empty() && state->response_broker != nullptr) {
+    failure = state->response_broker->Failure();
+  }
+  return failure;
+#else
+  return {};
+#endif
+}
 bool InferenceBackend::device_lost() const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
@@ -3773,7 +6208,8 @@ InferenceBackend::InitialOutputState InferenceBackend::initial_output_state(
     const ChatRequest& request) const {
 #if defined(ENGINE_ENABLE_HIP)
   const auto state = impl_->Snapshot();
-  return state != nullptr
+  // A TP2 rank 1 has no scheduler: it only executes rank 0's calls.
+  return state != nullptr && state->scheduler != nullptr
              ? state->scheduler->runner().InitialOutputState(request)
              : InitialOutputState::kAuto;
 #else
@@ -3964,6 +6400,15 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
 
   const std::string client_id =
       request.client_id.empty() ? "anonymous" : request.client_id;
+  if (state->control != nullptr) {
+    // TP2 rank 0 samples locally, so the constrained sampling config applies.
+    return impl_->StartTpRequest(
+        state, std::move(prompt->tokens), max_tokens, effective_sampling,
+        is_cancelled, stream_output, client_id, request.stop_sequences,
+        state->scheduler->runner().InitialOutputState(request), request_start,
+        request.cache_prompt, prompt->cache_prefix_tokens,
+        std::move(prompt->context));
+  }
   auto scheduled_request = state->scheduler->Submit(
       std::move(prompt->tokens), max_tokens, effective_sampling, is_cancelled,
       stream_output,
@@ -3980,7 +6425,7 @@ InferenceBackend::start_chat(const ChatRequest& request, std::size_t max_tokens,
   return std::make_shared<Impl::ScheduledGenerationRequest>(
       state, std::move(scheduled_request),
       state->scheduler->runner().InitialOutputState(effective_request),
-      tool_format);
+      nullptr, tool_format);
 #else
   return TextGenerationBackend::start_chat(request, max_tokens, sampling_config,
                                            is_cancelled, stream_output);

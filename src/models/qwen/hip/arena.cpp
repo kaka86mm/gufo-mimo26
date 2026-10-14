@@ -327,6 +327,8 @@ std::size_t QwenGpuSnapshot::SerializeCompact(
     PutLittleEndian<std::uint32_t>(destination, offset + 4, grid.height);
     PutLittleEndian<std::uint32_t>(destination, offset + 8, grid.width);
   }
+  // One wait for the whole walk; a queued copy's error only surfaces here.
+  transfer.FinishOrThrow();
   return destination.size();
 }
 
@@ -534,6 +536,8 @@ std::unique_ptr<QwenGpuSnapshot> QwenGpuArena::SaveSnapshot(
                 hipMemcpyDeviceToDevice);
   transfer.Copy(snapshot->d_ssm_deltanet_, d_ssm_deltanet_state, deltanet_bytes,
                 hipMemcpyDeviceToDevice);
+  // The snapshot is handed out ready to read: wait once for all of it.
+  transfer.FinishOrThrow();
   return snapshot;
 }
 

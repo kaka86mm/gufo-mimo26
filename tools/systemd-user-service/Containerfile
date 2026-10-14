@@ -1,0 +1,47 @@
+# ROCm 7.2.3 build and runtime environment for gufo with TP2 over RDMA.
+# The units run the gufo binary built from the checkout inside this image:
+#
+#   podman build -t localhost/gufo-tp2-dev:7.2.3 tools/systemd-user-service
+#
+# ibverbs-providers supplies the user-space RDMA drivers (mlx4/mlx5 for
+# InfiniBand and RoCE, irdma for Intel E810, and others). The first stage adds
+# usb4_rdma for USB4 cables with thunderbolt-ibverbs, built against the
+# image's rdma-core 50.0 from that project's patches.
+FROM docker.io/rocm/dev-ubuntu-24.04:7.2.3 AS usb4-rdma
+
+ARG RDMA_CORE=50.0
+ARG RDMA_CORE_SHA256=405b9dd551120da9d1b8944c5ad24ab1f478fb13caedf5bf0d47053a6d6e20cc
+ARG TBV_REF=v0.3.4
+ARG TBV_PATCHES="0001-providers-usb4_rdma-add-USB4-soft-RDMA-provider.patch:1ae10d2153f2e3e4ffa746a09bd20f9088910558c17da32638dc20f050c9923f 0002-CMakeLists.txt-build-the-usb4_rdma-provider.patch:9763afd8e2971875c77c6d212b7dd055afb70bedda8c9b2a10454a706f51cc0b"
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config python3 curl ca-certificates patch \
+    libnl-3-dev libnl-route-3-dev libudev-dev \
+  && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+RUN curl -fsSLO https://github.com/linux-rdma/rdma-core/releases/download/v${RDMA_CORE}/rdma-core-${RDMA_CORE}.tar.gz \
+  && echo "${RDMA_CORE_SHA256}  rdma-core-${RDMA_CORE}.tar.gz" | sha256sum -c - \
+  && tar xzf rdma-core-${RDMA_CORE}.tar.gz && cd rdma-core-${RDMA_CORE} \
+  && for p in ${TBV_PATCHES}; do \
+       curl -fsSLo patch.diff "https://raw.githubusercontent.com/hellas-ai/thunderbolt-ibverbs/${TBV_REF}/packaging/rdma-core-patches/${p%%:*}" \
+       && echo "${p##*:}  patch.diff" | sha256sum -c - && patch -p1 < patch.diff || exit 1; \
+     done \
+  && cmake -GNinja -B build -DNO_MAN_PAGES=1 -DNO_PYVERBS=1 -DENABLE_STATIC=0 \
+       -DENABLE_RESOLVE_NEIGH=0 -DCMAKE_BUILD_TYPE=Release \
+  && ninja -C build usb4_rdma-rdmav34 \
+  && cp build/lib/libusb4_rdma-rdmav34.so /src/
+
+FROM docker.io/rocm/dev-ubuntu-24.04:7.2.3
+
+RUN apt-get update && DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends \
+    build-essential cmake ninja-build pkg-config python3 python3-numpy \
+    libicu-dev libcurl4-openssl-dev libssl-dev libpng-dev libjpeg-dev ffmpeg \
+    libibverbs-dev ibverbs-providers libnl-3-dev libdw1 \
+    hipblas-dev hipblaslt-dev rocblas-dev hipcub-dev rocprim-dev rocwmma-dev \
+  && rm -rf /var/lib/apt/lists/*
+
+COPY --from=usb4-rdma /src/libusb4_rdma-rdmav34.so /usr/lib/x86_64-linux-gnu/libibverbs/
+RUN echo "driver usb4_rdma" > /etc/libibverbs.d/usb4_rdma.driver
+
+ENV ROCM_PATH=/opt/rocm
+WORKDIR /workspace/gufo

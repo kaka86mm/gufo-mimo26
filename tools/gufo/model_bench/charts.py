@@ -11,7 +11,8 @@ from .config import BenchConfig, TableSpec
 from .render import MARKER_RE, _number, layout_for, model_label, parse_table
 
 # Categorical slots from the validated default palette: Gufo, reference, Gufo speculative.
-COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a", "ref_spec": "#eda100"}
+COLORS = {"gufo": "#2a78d6", "reference": "#eb6834", "spec": "#1baf7a", "ref_spec": "#eda100",
+          "tp2": "#8a4fc8"}
 SURFACE = "#fcfcfb"
 TEXT = "#0b0b0b"
 TEXT_SECONDARY = "#52514e"
@@ -195,13 +196,29 @@ def chart_for(config: BenchConfig, table: TableSpec, rows: dict[str, dict[str, s
 
 def render_charts(config: BenchConfig, document: str, only: set[str] | None = None) -> tuple[str, list[str]]:
     """Draw charts for rendered tables and place an image line after each table."""
+    from .tp2 import Q8_LABEL, TABLES as RDMA_TABLES, chart_q8, chart_rdma
+
     known = {t.id: t for t in config.tables()}
     written: list[str] = []
     chart_dir = config.model_dir / CHART_DIR
+    tables = {m.group("id"): parse_table(m.group("body")) for m in MARKER_RE.finditer(document)}
 
     def replace(match: re.Match[str]) -> str:
         table_id = match.group("id")
         block = match.group(0)
+        if table_id == "tp2-q8" and (not only or table_id in only):
+            path = chart_dir / f"{table_id}.svg"
+            if chart_q8(config, tables[table_id], path):
+                written.append(table_id)
+                return block + f"\n\n![{Q8_LABEL}]({CHART_DIR}/{table_id}.svg)"
+            return block
+        if table_id in RDMA_TABLES and (not only or table_id in only):
+            path = chart_dir / f"{table_id}.svg"
+            title = chart_rdma(config, table_id, tables[table_id], path)
+            if title:
+                written.append(table_id)
+                return block + f"\n\n![{title}]({CHART_DIR}/{table_id}.svg)"
+            return block
         if table_id not in known or (only and table_id not in only):
             return block
         path = chart_dir / f"{table_id}.svg"
@@ -211,7 +228,7 @@ def render_charts(config: BenchConfig, document: str, only: set[str] | None = No
         return block
 
     # Replace only selected charts; untouched table links must survive a partial render.
-    for table_id in known:
+    for table_id in [*known, *RDMA_TABLES]:
         if not only or table_id in only:
             document = re.sub(IMAGE_RE.format(id=re.escape(table_id)), "", document)
     return MARKER_RE.sub(replace, document), written

@@ -916,6 +916,9 @@ extern "C" int ds4_gpu_tensor_snapshot_read(const ds4_gpu_tensor* tensor,
   try {
     thread_local gufo::hip::SnapshotTransfer transfer;
     transfer.Copy(data, static_cast<const char*>(tensor->ptr) + offset, bytes);
+    // The thread_local transfer outlives this call, so wait here: the caller
+    // reads `data` as soon as this returns.
+    transfer.FinishOrThrow();
     return 1;
   } catch (const std::exception&) {
     return 0;

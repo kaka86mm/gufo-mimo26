@@ -73,6 +73,9 @@ endif()
 # Qwen3.8-Flash-Next — model-private CPU reference plus ROCm runtime.
 add_subdirectory(src/models/qwen38_flash_next)
 
+# MiMo-V2.6 — model-private CPU reference plus ROCm runtime.
+add_subdirectory(src/models/mimo2)
+
 # Qwen3-TTS — CPU reference + HIP kernels (CustomVoice 12Hz).
 add_subdirectory(src/models/qwen3_tts)
 
@@ -218,13 +221,17 @@ add_library(gufo_llm_cli STATIC
 target_link_libraries(gufo_llm_cli PUBLIC gufo_core)
 if(ENGINE_ENABLE_HIP)
   target_link_libraries(gufo_llm_cli PUBLIC gufo_deepseek_v4_flash
-    gufo_qwen38_flash_next)
+    gufo_qwen38_flash_next gufo_mimo2)
 endif()
 
 add_library(gufo_logging STATIC src/cli/serve/logging.cpp src/cli/serve/trace.cpp)
 target_include_directories(gufo_logging PUBLIC ${PROJECT_SOURCE_DIR})
 target_compile_features(gufo_logging PUBLIC cxx_std_20)
 
+add_library(gufo_tp_control STATIC src/cli/serve/tp_control.cpp)
+target_include_directories(gufo_tp_control PUBLIC ${PROJECT_SOURCE_DIR})
+target_compile_features(gufo_tp_control PUBLIC cxx_std_20)
+target_link_libraries(gufo_tp_control PUBLIC gufo_core Threads::Threads)
 # The imported DeepSeek V4 Flash runtime routes its informational messages
 # through the shared logger instead of writing to stderr directly, so it needs
 # the threshold that `--log-level` arms.
@@ -260,10 +267,17 @@ add_executable(gufo
   src/cli/serve/component_text_cache.cpp
   src/cli/serve/text_model_runner.cpp
   src/cli/serve/text_generation_scheduler.cpp
+  src/cli/serve/tp_executor.cpp
+  src/cli/serve/tp_disk_store.cpp
   src/cli/serve/inference_backend.cpp
   src/eval/http_client.cpp
 )
-target_link_libraries(gufo PRIVATE gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http CURL::libcurl)
+target_link_libraries(gufo PRIVATE
+  gufo_cache gufo_diagnostics gufo_core gufo_llm_cli gufo_http
+  gufo_tp_control CURL::libcurl)
+if (GUFO_ENABLE_TP2_RDMA)
+  target_compile_definitions(gufo PRIVATE GUFO_ENABLE_TP2_RDMA=1)
+endif()
 target_compile_definitions(gufo PRIVATE
   GUFO_RELEASE_VERSION="${GUFO_RELEASE_VERSION}"
   GUFO_REVISION="${GUFO_REVISION}"
@@ -398,6 +412,34 @@ if (BUILD_TESTING)
   target_link_libraries(arg_parser_test PRIVATE gufo_core)
   add_test(NAME arg_parser_test COMMAND arg_parser_test)
   set_tests_properties(arg_parser_test PROPERTIES LABELS "cpu;cli")
+
+  add_executable(tp_control_test tests/cli/tp_control_test.cpp)
+  target_link_libraries(tp_control_test PRIVATE gufo_tp_control)
+  add_test(NAME tp_control_test COMMAND tp_control_test)
+  set_tests_properties(tp_control_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 10)
+
+  # A measurement, not a gate: it asserts no threshold and never fails on a
+  # slow result, so it is labelled `perf` and kept out of the correctness run.
+  add_executable(tp_instruction_latency_test
+    tests/cli/tp_instruction_latency_test.cpp)
+  target_link_libraries(tp_instruction_latency_test PRIVATE gufo_tp_control)
+  add_test(NAME tp_instruction_latency_test
+    COMMAND tp_instruction_latency_test)
+  set_tests_properties(tp_instruction_latency_test PROPERTIES
+    LABELS "cpu;tp2;perf" TIMEOUT 300)
+
+  add_executable(tp_executor_test
+    tests/cli/tp_executor_test.cpp
+    src/cli/serve/continuation_cache.cpp
+    src/cli/serve/continuation_disk_store.cpp
+    src/cli/serve/text_model_runner.cpp
+    src/cli/serve/text_generation_scheduler.cpp
+    src/cli/serve/tp_executor.cpp
+    src/cli/serve/tp_disk_store.cpp)
+  target_link_libraries(tp_executor_test PRIVATE
+    gufo_logging gufo_core gufo_tp_control)
+  add_test(NAME tp_executor_test COMMAND tp_executor_test)
+  set_tests_properties(tp_executor_test PROPERTIES LABELS "cpu;tp2" TIMEOUT 60)
 
   add_executable(json_constraint_test tests/core/json_constraint_test.cpp)
   target_link_libraries(json_constraint_test PRIVATE gufo_core)

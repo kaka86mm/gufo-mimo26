@@ -6,6 +6,7 @@
 #include <cstddef>
 #include <functional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace gufo::hip {
@@ -13,6 +14,11 @@ namespace gufo::hip {
 /// Copies a frozen session on a separate stream. Callers have completed that
 /// session's model operation before capture, and keep its state alive and
 /// unchanged until all copies finish. Other sessions may continue executing.
+///
+/// The copies are queued back to back and waited on once, in Finish() or the
+/// destructor. A snapshot is a hundred-odd small regions; syncing after each
+/// one cost seconds on a busy device, because every sync is a driver round
+/// trip that cannot overlap the compute stream's work.
 class SnapshotTransfer {
 public:
   SnapshotTransfer() {
@@ -51,7 +57,28 @@ public:
               std::size_t height, hipMemcpyKind kind = hipMemcpyDeviceToHost) {
     Check(hipMemcpy2DAsync(destination, destination_pitch, source, source_pitch,
                            width, height, kind, stream_));
-    Check(hipStreamSynchronize(stream_));
+  }
+
+  /// Waits for every copy queued so far and reports a failed one. Callers that
+  /// publish the destination must check this: a copy's error only surfaces
+  /// here.
+  [[nodiscard]] bool Finish(std::string* error = nullptr) {
+    const hipError_t status = hipStreamSynchronize(stream_);
+    if (status == hipSuccess) {
+      return true;
+    }
+    if (error != nullptr) {
+      *error = hipGetErrorString(status);
+    }
+    return false;
+  }
+
+  /// Finish() for callers with no error channel of their own.
+  void FinishOrThrow() {
+    std::string error;
+    if (!Finish(&error)) {
+      throw std::runtime_error("snapshot copy failed: " + error);
+    }
   }
 
 private:

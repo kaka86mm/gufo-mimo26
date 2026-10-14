@@ -1,0 +1,12 @@
+# Default-quantization wrapper for the gufo@.service template on the rank 0
+# host: "systemctl --user start gufo" starts gufo@q8.
+[Unit]
+Description=Gufo TP=2 two-host LLM server (default: q8)
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+TimeoutStartSec=5min
+TimeoutStopSec=5min
+ExecStart=/usr/bin/systemctl --user start gufo@q8.service
+ExecStop=/usr/bin/systemctl --user stop gufo@q8.service
