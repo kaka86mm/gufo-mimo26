@@ -74,6 +74,36 @@ bool EndsTurn(const State& state, const Tokens& tokens, int token) {
 
 namespace {
 
+/// Disk-checkpoint cadence overrides (2026-10-14 long-context window).
+/// The store's defaults are 2048 tokens between checkpoints and at most four
+/// intermediate boundaries per prefill; agent turns advance less than a step,
+/// so those defaults leave the cache sitting at a stale depth and every turn
+/// re-prefills the gap. Both knobs are read here so the A/B needs no new flags.
+struct DiskCheckpointOverrides {
+  std::size_t min_step;
+  std::size_t shared_boundaries;
+};
+
+[[nodiscard]] DiskCheckpointOverrides DiskCheckpointOverridesFromEnv() {
+  static const DiskCheckpointOverrides values = [] {
+    DiskCheckpointOverrides out{
+        TextRunnerDiskCacheOptions{}.min_checkpoint_step_tokens,
+        TextRunnerDiskCacheOptions{}.shared_prefix_max_boundaries};
+    if (const char* env = getenv("GUFO_DISK_MIN_STEP")) {
+      const long v = std::strtol(env, nullptr, 10);
+      if (v >= 0)
+        out.min_step = static_cast<std::size_t>(v);
+    }
+    if (const char* env = getenv("GUFO_DISK_SHARED_BOUNDARIES")) {
+      const long v = std::strtol(env, nullptr, 10);
+      if (v > 0)
+        out.shared_boundaries = static_cast<std::size_t>(v);
+    }
+    return out;
+  }();
+  return values;
+}
+
 using Clock = std::chrono::steady_clock;
 
 void SetError(std::string* error, std::string message) {
@@ -5736,10 +5766,13 @@ bool InferenceBackend::load(std::shared_ptr<const hip::QwenGpuModel> model,
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
+      const auto disk_overrides = DiskCheckpointOverridesFromEnv();
       runner_disk_cache = TextRunnerDiskCacheOptions{
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .shared_prefix_max_boundaries = disk_overrides.shared_boundaries,
+          .min_checkpoint_step_tokens = disk_overrides.min_step,
       };
     }
     Logger::Info("loader",
@@ -5825,10 +5858,13 @@ bool InferenceBackend::load(
     new_state->max_context = max_context;
     std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
     if (DiskCacheEnabled(disk_cache_config)) {
+      const auto disk_overrides = DiskCheckpointOverridesFromEnv();
       runner_disk_cache = TextRunnerDiskCacheOptions{
           .directory = std::move(disk_cache_config.directory),
           .capacity_bytes = disk_cache_config.capacity_bytes,
           .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+          .shared_prefix_max_boundaries = disk_overrides.shared_boundaries,
+          .min_checkpoint_step_tokens = disk_overrides.min_step,
       };
     }
     auto runner_pool = std::make_shared<TextRunnerPool>(

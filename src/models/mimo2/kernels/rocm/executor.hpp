@@ -537,7 +537,8 @@ private:
                      std::uint32_t visible_keys = 0,
                      std::uint32_t wide_splits = 1,
                      const std::uint32_t* row_slot = nullptr,
-                     const std::uint32_t* row_pos = nullptr) const;
+                     const std::uint32_t* row_pos = nullptr,
+                     std::uint32_t window_override = 0) const;
   /// Sums `rows` rows of a partial across ranks.
   bool AllReduce(float* data, std::size_t rows, std::string* error_msg) const;
   /// Selects the greedy token or compact candidates from the draft logits.

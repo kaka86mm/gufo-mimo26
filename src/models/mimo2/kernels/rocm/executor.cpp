@@ -2262,10 +2262,17 @@ bool Executor::AttentionPart(const DeviceLayer& l, Session::AttentionState& s,
                              std::uint32_t visible_keys,
                              std::uint32_t wide_splits,
                              const std::uint32_t* row_slot,
-                             const std::uint32_t* row_pos) const {
+                             const std::uint32_t* row_pos,
+                             std::uint32_t window_override) const {
   const PhaseScope _ps(&kPhases.attn_ms, &kPhases.attn_n);
     if (kEntryTrace) { fprintf(stderr, "ENTRY exec:AttentionPart\n"); fflush(stderr); }
   const Config& c = config();
+  // A caller may bound a normally-global layer's range: the MTP draft block
+  // only needs its recent context, and the kernel's window path reads the same
+  // linear cache at absolute positions when there is no ring (ring_rows == 0).
+  const std::uint32_t window = window_override != 0
+                                   ? window_override
+                                   : (l.swa ? c.sliding_window : 0U);
   static const bool attn_trace = getenv("GUFO_FFN_TRACE") != nullptr;
   static std::uint32_t attn_trace_n = 0;
   // Sampling keeps the steady-state trace to ~one call per 48-layer sweep;
@@ -2379,7 +2386,7 @@ bool Executor::AttentionPart(const DeviceLayer& l, Session::AttentionState& s,
                     s_.ctx, attn_splits > 1 ? s_.attn_partials : nullptr,
                     attn_splits, n_tokens, l.q_heads, l.kv_heads,
                     c.head_dim_qk, c.head_dim_v,
-                    l.swa ? c.sliding_window : 0, cohort_keys, stream_);
+                    window, cohort_keys, stream_);
     } else {
       // One row, one session: the split count is the only parallelism the
       // shared-KV form has at depth, so the single-token path needs it too.
@@ -2387,7 +2394,7 @@ bool Executor::AttentionPart(const DeviceLayer& l, Session::AttentionState& s,
                     l.attn_sinks.empty() ? nullptr : l.attn_sinks.f32(), s_.ctx,
                     attn_splits > 1 ? s_.attn_partials : nullptr, attn_splits,
                     n_tokens, pos, l.q_heads, l.kv_heads, c.head_dim_qk,
-                    c.head_dim_v, l.swa ? c.sliding_window : 0, cohort_keys,
+                    c.head_dim_v, window, cohort_keys,
                     stream_);
     }
   } else {
@@ -2396,7 +2403,7 @@ bool Executor::AttentionPart(const DeviceLayer& l, Session::AttentionState& s,
               attn_splits > 1 ? s_.attn_partials : nullptr, attn_splits,
               wide, n_tokens, pos,
               l.q_heads, l.kv_heads, c.head_dim_qk, c.head_dim_v,
-              l.swa ? c.sliding_window : 0, s.swa_rows, cohort_keys, stream_,
+              window, s.swa_rows, cohort_keys, stream_,
               s.k_cache_q, s.v_cache_q, s.k_scales, s.v_scales);
   }
   const auto at3 = std::chrono::steady_clock::now();
@@ -4137,12 +4144,25 @@ bool Executor::MtpBody(Session& session, std::uint32_t n, std::uint32_t pos,
   attn.swa_rows = session.mtp_().swa_rows;
   RmsNormRows(s_.res, block.attn_norm.f32(), s_.xn, n, c.hidden_size, 1,
               c.rms_eps, stream_);
+  // GUFO_MTP_DRAFT_WINDOW bounds the draft block's attention range. The
+  // trunk verifies every draft, so a shorter draft context costs acceptance,
+  // never output correctness; what it buys is a draft pass whose cost stops
+  // growing with the conversation (the reason the length policy stops
+  // drafting past ~32K).
+  static const std::uint32_t draft_window = [] {
+    const char* env = getenv("GUFO_MTP_DRAFT_WINDOW");
+    const long v = env != nullptr ? std::strtol(env, nullptr, 10) : 0;
+    return static_cast<std::uint32_t>(v > 0 ? v : 0);
+  }();
   if (!AttentionPart(block, attn, s_.xn, s_.block_out, n,
                      &session.control_->mtp_position, error_msg,
                      /*projections_ready=*/false,
                      /*project_output=*/true,
                      /*slot_table=*/nullptr, /*slot=*/0,
-                     session.mtp_().position + n)) {
+                     session.mtp_().position + n,
+                     /*wide_splits=*/1,
+                     /*row_slot=*/nullptr, /*row_pos=*/nullptr,
+                     draft_window)) {
     return false;
   }
   AddResidual(s_.res, s_.block_out, n);
