@@ -6,6 +6,7 @@
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <span>
 
 #include "src/models/mimo2/mtp_costs.hpp"
@@ -13,6 +14,45 @@
 namespace gufo::models::mimo2 {
 
 inline constexpr std::uint32_t kMaxMtpDraftTokens = 7;
+
+/// Weight of the running hit-rate history. The historical 0.75 (effective
+/// window ~7 samples) let the per-depth estimate jitter across the
+/// draft/no-draft threshold, and every spurious "no width repays" verdict
+/// then bought a long retry window: with the calibrated C1 costs the lone
+/// path drafted only ~58% of cycles at a true 0.6 depth-1 hit rate.
+/// GUFO_MTP_ACCEPT_DECAY=0.9 (window ~19) is the measured follow-up.
+[[nodiscard]] inline float MtpAcceptanceDecay() noexcept {
+  static const float decay = [] {
+    const char* env = getenv("GUFO_MTP_ACCEPT_DECAY");
+    if (env == nullptr) {
+      return 0.75F;
+    }
+    const float value = std::strtof(env, nullptr);
+    return value >= 0.5F && value <= 0.99F ? value : 0.75F;
+  }();
+  return decay;
+}
+
+/// Retry window (plain-decode cycles) after a near-miss verdict: the
+/// estimate sits within kMtpNearMissMargin of the break-even, so a rebound
+/// is cheap to catch and re-testing often is worth it.
+/// GUFO_MTP_RETRY_TOKENS=4 is the measured follow-up; the historical
+/// window is 16.
+[[nodiscard]] inline std::uint32_t MtpRetryTokens() noexcept {
+  static const std::uint32_t retry = [] {
+    const char* env = getenv("GUFO_MTP_RETRY_TOKENS");
+    if (env == nullptr) {
+      return 16U;
+    }
+    const long value = std::strtol(env, nullptr, 10);
+    return value >= 0 && value <= 64 ? static_cast<std::uint32_t>(value) : 16U;
+  }();
+  return retry;
+}
+
+/// Confidence band of the near-miss rule, in hit-rate units (~1.4 sigma of
+/// the smoothed estimate at a 0.9 decay).
+inline constexpr float kMtpNearMissMargin = 0.15F;
 
 /// Samples of a width's cycle cost before the batch policy treats it as
 /// measured rather than bootstrapped (a caller's verdict may not read the
@@ -115,10 +155,11 @@ public:
     accepted = std::min(accepted, drafted);
     const auto observed = accepted + (accepted < drafted ? 1 : 0);
     for (std::size_t depth = 0; depth < observed; ++depth) {
+      const float decay = MtpAcceptanceDecay();
       state_.successes[depth] =
-          0.75F * state_.successes[depth] + (depth < accepted ? 1.0F : 0.0F);
+          decay * state_.successes[depth] + (depth < accepted ? 1.0F : 0.0F);
       state_.failures[depth] =
-          0.75F * state_.failures[depth] + (depth == accepted ? 1.0F : 0.0F);
+          decay * state_.failures[depth] + (depth == accepted ? 1.0F : 0.0F);
     }
     // A fully accepted chain supplies no observations for its tail. Probe
     // farther rather than permanently treating those depths as the prior.
@@ -135,8 +176,17 @@ public:
         std::max<std::uint32_t>(state_.explored_depth, observed);
     if (accepted < drafted)
       state_.failed_depths |= 1U << accepted;
-    if (BestLength(limit_, context) == 0)
-      state_.retry_tokens = 16;
+    if (BestLength(limit_, context) == 0) {
+      // A near-miss verdict (the estimate is within its own noise of the
+      // break-even) retries quickly so a rebound is cheap to catch; a
+      // confident verdict keeps the long window.
+      const auto retry_costs = MtpCycleCosts(context, concurrency_);
+      const float break_even = retry_costs[1] / retry_costs[0] - 1.0F;
+      state_.retry_tokens =
+          Probability(0) >= break_even - kMtpNearMissMargin
+              ? MtpRetryTokens()
+              : 16U;
+    }
   }
 
   void ObserveArToken() noexcept {

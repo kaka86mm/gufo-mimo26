@@ -5,6 +5,7 @@
 #include <array>
 #include <cstddef>
 #include <cstdint>
+#include <cstdlib>
 #include <utility>
 
 namespace gufo::models::mimo2 {
@@ -136,6 +137,30 @@ inline constexpr float kMtpCatchUpMilliseconds[4] = {3.8F, 4.2F, 5.5F, 7.3F};
       const auto marginal =
           high - kMtpCycleMilliseconds[interval + 1][cohort][i - 1];
       costs[i] = std::max(costs[i], costs[i - 1] + marginal);
+    }
+  }
+  // GUFO_MTP_COST_SCALE compresses the "another verified row" marginals.
+  // The 2026-10-04 rows priced a second-draft cycle at +48% of a plain C1
+  // cycle; the 2026-10-13 mtpmeas sweep on the current build measures +37-40%
+  // on the MXFP4 trunk (+26% on EXL3), so the lone path demanded p1>0.476 to
+  // draft while the true break-even sits at 0.37-0.40. 0.80 makes the C1
+  // ratio 1+0.476*0.80 = 1.38, matching the measurement; 1.0 keeps the
+  // historical rows.
+  static const float verify_scale = [] {
+    const char* env = getenv("GUFO_MTP_COST_SCALE");
+    if (env == nullptr) {
+      return 1.0F;
+    }
+    const float value = std::strtof(env, nullptr);
+    return value > 0.0F && value <= 4.0F ? value : 1.0F;
+  }();
+  // Only the C1 cohort row carries the lone-request path: the batch rows keep
+  // the historical marginals (the 2026-10-13 sweep priced a batched verify
+  // row no cheaper than the table does - deeper cohorts must keep latching
+  // plain until their rows are re-measured).
+  if (verify_scale < 1.0F && cohort == 0) {
+    for (std::size_t i = 1; i < costs.size(); ++i) {
+      costs[i] = costs[i - 1] + (costs[i] - costs[i - 1]) * verify_scale;
     }
   }
   return costs;
