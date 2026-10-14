@@ -468,6 +468,14 @@ std::uint64_t Session::SnapshotBytes() const {
          model_->executor_->SnapshotBytes(*session_, KeptHiddenRows());
 }
 
+std::size_t Session::SnapshotHeaderBytes() noexcept {
+  return sizeof(SessionSnapshotHeader);
+}
+
+std::uint32_t Session::MtpPosition() const noexcept {
+  return MtpEnabled() ? session_->mtp_position() : 0;
+}
+
 std::unique_ptr<SessionSnapshot> Session::SaveSnapshot(
     std::string* error_msg) const {
   if (!valid_ || tokens_.empty() || tokens_.size() != session_->position() ||

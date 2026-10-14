@@ -41,6 +41,10 @@ public:
 
   [[nodiscard]] bool mtp_enabled() const noexcept { return mtp_enabled_; }
   [[nodiscard]] std::uint32_t position() const noexcept { return position_; }
+  /// First position of this session's MTP draft batch (0 when none is set).
+  [[nodiscard]] std::uint32_t mtp_position() const noexcept {
+    return mtp_blocks_.empty() ? 0 : mtp_blocks_.front().position;
+  }
   [[nodiscard]] std::uint32_t max_context() const noexcept {
     return max_context_;
   }
@@ -400,6 +404,32 @@ public:
                                      std::span<const std::uint8_t> payload,
                                      SnapshotInfo* info, std::string* error_msg,
                                      std::uint32_t next_drafts = 0) const;
+
+  /// Visitor over the executor snapshot payload's device regions, in payload
+  /// order. `offset`/`bytes` are payload-relative; `device` is null for
+  /// layout-only walks. The names mark region kinds ("cache", "cache window",
+  /// "draft residual", "kept trunk rows"). Used by out-of-band payload
+  /// consumers (the component cache) that split the snapshot into components.
+  using SnapshotRegionVisitor =
+      std::function<bool(void* device, std::uint64_t offset,
+                         std::uint64_t bytes, const char* what)>;
+  /// Bytes of the executor payload's own leading header.
+  [[nodiscard]] static std::size_t SnapshotHeaderBytes() noexcept;
+  /// Payload layout at a given shape, without a session (device pointers null).
+  /// The walk prepends the payload header as its first region so out-of-band
+  /// consumers can reproduce a byte-exact payload; Save/Restore keep their own
+  /// walk, which writes that header separately.
+  [[nodiscard]] bool VisitSnapshotLayout(std::uint32_t position,
+                                         std::uint32_t hidden_rows,
+                                         std::uint32_t mtp_position,
+                                         bool has_mtp,
+                                         const SnapshotRegionVisitor& visit)
+      const;
+  /// Live walk carrying device pointers for the session's current state.
+  [[nodiscard]] bool VisitSnapshotRegions(const Session& session,
+                                          std::uint32_t hidden_rows,
+                                          const SnapshotRegionVisitor& visit)
+      const;
 
   /// Rewinds the draft block's own context.
   void MtpRewind(Session& session, std::uint32_t position) const noexcept {

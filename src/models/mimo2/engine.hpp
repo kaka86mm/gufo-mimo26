@@ -66,6 +66,7 @@ struct ModelOptions {
 
 class Session;
 class SessionSnapshot;
+class ContinuationAdapter;
 
 /// Gufo-owned API over the ROCm runtime: one resident model, any number of
 /// sessions with shared projection batches and independent context state.
@@ -157,6 +158,7 @@ private:
 
   friend class Session;
   friend class DFlashV1Target;
+  friend class ContinuationAdapter;
 };
 
 /// One conversation's context. Sync feeds a prompt (reusing whatever prefix
@@ -238,6 +240,13 @@ public:
   /// A new request reusing cached context starts its own acceptance history.
   void ResetDraftPolicy() noexcept { draft_length_.Reset(); }
 
+  /// Trunk rows the draft block may still read: [hidden_base_, tokens).
+  [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
+  /// The draft block's own context position (0 without MTP).
+  [[nodiscard]] std::uint32_t MtpPosition() const noexcept;
+  /// Bytes of the fixed session-snapshot header that precedes the tokens.
+  [[nodiscard]] static std::size_t SnapshotHeaderBytes() noexcept;
+
   struct SpeculativeStats {
     std::uint64_t cycles{0};
     std::uint64_t drafted{0};
@@ -270,8 +279,6 @@ private:
 
   bool Feed(std::span<const std::int32_t> tokens, std::string* error_msg,
             bool prefill = false);
-  /// Trunk rows the draft block may still read: [hidden_base_, size).
-  [[nodiscard]] std::uint32_t KeptHiddenRows() const noexcept;
   bool DraftCatchUp(std::int32_t next_token, bool propose,
                     std::string* error_msg,
                     MtpCandidateLogits* candidates = nullptr);

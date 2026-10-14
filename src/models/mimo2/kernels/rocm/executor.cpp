@@ -3814,6 +3814,52 @@ bool Executor::SaveSnapshot(const Session& session, std::uint32_t hidden_rows,
   return transfer.Finish(error_msg) && walked;
 }
 
+std::size_t Executor::SnapshotHeaderBytes() noexcept {
+  return sizeof(SnapshotHeader);
+}
+
+bool Executor::VisitSnapshotLayout(std::uint32_t position,
+                                   std::uint32_t hidden_rows,
+                                   std::uint32_t mtp_position,
+                                   bool has_mtp,
+                                   const SnapshotRegionVisitor& visit) const {
+  if (!visit || position == 0 || hidden_rows > position ||
+      hidden_rows > options_.max_speculative || mtp_position > position) {
+    return false;
+  }
+  SnapshotHeader h{};
+  h.magic = kSnapshotMagic;
+  h.num_layers = config().num_layers;
+  h.nextn_blocks = static_cast<std::uint32_t>(model_->nextn_layers().size());
+  h.hidden_size = config().hidden_size;
+  h.head_dim_qk = config().head_dim_qk;
+  h.head_dim_v = config().head_dim_v;
+  h.tp_world_size = model_->tp_world_size();
+  h.has_mtp = has_mtp ? 1 : 0;
+  h.position = position;
+  h.hidden_rows = hidden_rows;
+  h.mtp_position = mtp_position;
+  if (!visit(nullptr, 0, sizeof(SnapshotHeader), "payload header")) {
+    return false;
+  }
+  return WalkSnapshot(h, nullptr, visit) != 0;
+}
+
+bool Executor::VisitSnapshotRegions(const Session& session,
+                                    std::uint32_t hidden_rows,
+                                    const SnapshotRegionVisitor& visit) const {
+  if (!visit || session.owner_ != this || session.spec_tokens_ != 0 ||
+      hidden_rows > session.position_ ||
+      hidden_rows > options_.max_speculative) {
+    return false;
+  }
+  SnapshotHeader h =
+      MakeSnapshotHeader(config(), *model_, session.mtp_enabled_, session);
+  h.mtp_position = session.mtp_().position;
+  h.hidden_rows = hidden_rows;
+  return WalkSnapshot(h, &session, visit) != 0;
+}
+
 bool Executor::RestoreSnapshot(Session& session,
                                std::span<const std::uint8_t> payload,
                                SnapshotInfo* info, std::string* error_msg,

@@ -49,6 +49,7 @@
 #include "src/models/deepseek_v4_flash/dspark_sampler.hpp"
 #include "src/models/deepseek_v4_flash/engine.hpp"
 #include "src/models/mimo2/chat_template.hpp"
+#include "src/models/mimo2/continuation_adapter.hpp"
 #include "src/models/mimo2/dflash_v1.hpp"
 #include "src/models/mimo2/dflash_v1_target.hpp"
 #include "src/models/mimo2/engine.hpp"
@@ -3484,6 +3485,12 @@ public:
     }
   }
 
+  /// Binds a session owned by a component-cache slot. The slot keeps the
+  /// session alive; the state shares it and never outlives it.
+  Mimo2TextRunnerState(const std::shared_ptr<Mimo2Model>& model,
+                       std::shared_ptr<Mimo2Session> bound)
+      : model_(model), session_(std::move(bound)) {}
+
   void Invalidate() noexcept override {
     // States come from a pool: the next request starts speculating again.
     ar_mode_ = false;
@@ -3965,7 +3972,7 @@ private:
   }
 
   std::shared_ptr<Mimo2Model> model_;
-  std::unique_ptr<Mimo2Session> session_;
+  std::shared_ptr<Mimo2Session> session_;
   std::unique_ptr<models::mimo2::DFlashV1Target> dflash_target_;
   std::unique_ptr<speculative::SpeculativeVerifier> verifier_;
   /// Owned by verifier_; used only to account the session's draft allocations.
@@ -4057,6 +4064,160 @@ public:
         identity.insert(identity.end(), rank.begin(), rank.end());
       }
     }
+    if (persistence_) {
+      component_identity_ = persistence_->compatibility_identity;
+    } else {
+      // The typed in-process API need not supply artifact fingerprints when
+      // disk caching is disabled; a process-local identity still separates
+      // component checkpoints from another model instance's.
+      std::ostringstream identity;
+      identity << "schema=gufo-process-text-continuation-v1\n"
+               << "model_instance=" << model_.get() << '\n'
+               << "context_tokens=" << max_context_ << '\n'
+               << "mtp=" << use_mtp_ << '\n'
+               << "draft_max_tokens=" << max_draft_tokens_ << '\n'
+               << "draft_cost_concurrency=" << model_->DecodeConcurrency()
+               << '\n';
+      const auto canonical = identity.str();
+      component_identity_.assign(canonical.begin(), canonical.end());
+    }
+  }
+
+  [[nodiscard]] bool UsesComponentCache() const override {
+    // DFlash sessions keep no serializable draft state, so they opt out of
+    // snapshots and stay on the legacy continuation cache.
+    return !use_dflash();
+  }
+
+  [[nodiscard]] std::unique_ptr<ComponentCacheResources>
+  CreateComponentCacheResources(cache::ResourceLedger& ledger,
+                                std::size_t ram) const override {
+    struct Backing {
+      hip::TransferPool streams{64};
+      std::unique_ptr<hip::CommittedBackingPool> pool;
+      std::size_t largest{0};
+    };
+    auto result = std::make_unique<ComponentCacheResources>();
+    auto adapter = std::make_unique<models::mimo2::ContinuationAdapter>(
+        model_,
+        use_mtp_ ? gufo::core::SessionMode::kSpeculative
+                 : gufo::core::SessionMode::kAutoregressive,
+        max_context_, component_identity_);
+    (void)ram;  // Backing sizing follows actual slot allocation below.
+    auto backing = std::make_shared<Backing>();
+    backing->largest = adapter->LargestPayloadBytes();
+    result->adapter = std::move(adapter);
+    // Payloads allocate whole 64 KiB blocks from the pool's committed
+    // segments; a payload never spans two segments.
+    constexpr std::size_t kBlockBytes = std::size_t{64} << 10;
+    // The restore assembles one shared payload buffer, so loads must not run
+    // concurrently.
+    result->transfer_batch_size = 1;
+    result->commit_backing = [backing, &ledger](std::size_t budget) {
+      const auto blocks =
+          std::max<std::size_t>(2, budget / kBlockBytes);
+      const auto target =
+          std::max<std::size_t>(std::size_t{1} << 30, 2 * backing->largest) /
+          kBlockBytes;
+      const auto parts =
+          std::max<std::size_t>((blocks + target - 1) / target, 1);
+      const auto segment = (blocks + parts - 1) / parts * kBlockBytes;
+      struct Limited {
+        std::mutex mutex;
+        std::chrono::steady_clock::time_point refused;
+        bool active{};
+      };
+      backing->pool = std::make_unique<hip::CommittedBackingPool>(
+          ledger,
+          hip::BackingPoolConfig{
+              blocks * kBlockBytes, kBlockBytes, 0, segment,
+              [limited = std::make_shared<Limited>()](std::size_t bytes) {
+                const std::lock_guard lock(limited->mutex);
+                const auto now = std::chrono::steady_clock::now();
+                if (limited->active &&
+                    now - limited->refused < std::chrono::seconds(1))
+                  return false;
+                const auto ceiling = HostSnapshotCeilingBytes();
+                std::size_t heap_free = 0, heap_total = 0;
+                const bool heap_fits =
+                    hipMemGetInfo(&heap_free, &heap_total) == hipSuccess &&
+                    hip::HeapFitsAboveReserve(heap_free, bytes);
+                if (ceiling >= bytes && heap_fits) {
+                  limited->active = false;
+                  return true;
+                }
+                if (!limited->active)
+                  Logger::Warn(
+                      "cache",
+                      "schema=component-cache-v1 event=backing_limited reason=" +
+                          std::string(heap_fits ? "host_reserve "
+                                                : "device_heap_reserve ") +
+                          "segment_bytes=" + std::to_string(bytes) +
+                          " host_headroom_bytes=" + std::to_string(ceiling) +
+                          " device_heap_free_bytes=" +
+                          std::to_string(heap_free));
+                limited->active = true;
+                limited->refused = now;
+                return false;
+              }});
+      backing->pool->GrowAhead();
+    };
+    result->owner = backing;
+    result->stream = [backing]() -> std::unique_ptr<cache::Stream> {
+      return backing->streams.TryAcquire();
+    };
+    result->allocate = [backing](const cache::PayloadRequest& request) {
+      const auto segments = backing->pool->PageCommitAllocations();
+      auto block = backing->pool->TryAcquire(request.category, request.bytes);
+      if (backing->pool->PageCommitAllocations() != segments)
+        Logger::Info(
+            "cache",
+            "schema=component-cache-v1 event=backing_grown committed_bytes=" +
+                std::to_string(backing->pool->CommittedBytes()) + " segments=" +
+                std::to_string(backing->pool->PageCommitAllocations()));
+      if (!block)
+        throw cache::ResourceExhausted();
+      backing->pool->GrowAhead();
+      auto owner = std::make_shared<hip::BackingBlock>(std::move(*block));
+      return ComponentCaptureBuffer{
+          owner->Bytes(),
+          [owner] {
+            owner->Convert();
+            return std::move(*owner).TakePayload();
+          },
+          backing->pool.get(),
+          {}};
+    };
+    result->staging = [](std::size_t bytes) {
+      void* data = nullptr;
+      const auto status = hipHostMalloc(&data, bytes, hipHostMallocCoherent);
+      if (status != hipSuccess)
+        throw std::runtime_error(hipGetErrorString(status));
+      auto owner = std::shared_ptr<void>(
+          data, [](void* value) { (void)hipHostFree(value); });
+      std::memset(data, 0, bytes);
+      return cache::StagingAllocation{
+          std::move(owner), {static_cast<std::uint8_t*>(data), bytes}};
+    };
+    result->copy_observed_rows = [](auto source, auto destination,
+                                    cache::Stream& stream) {
+      return dynamic_cast<hip::TransferStream&>(stream).Copy(
+          destination.data(), source.data(), destination.size(),
+          hip::CopyDirection::kDeviceToHost, destination.size());
+    };
+    return result;
+  }
+
+  [[nodiscard]] std::unique_ptr<TextRunnerState> BindComponentState(
+      cache::Adapter& adapter, cache::Slot& slot) const override {
+    auto& mimo = dynamic_cast<models::mimo2::ContinuationAdapter&>(adapter);
+    return std::make_unique<Mimo2TextRunnerState>(model_,
+                                                  mimo.SharedSession(slot));
+  }
+
+  void ReconcileComponentState(TextRunnerState& state,
+                               std::size_t position) const override {
+    RequireMimo2State(state).set_position(position);
   }
 
   [[nodiscard]] TextRunnerDescriptor Descriptor() const override {
@@ -4776,14 +4937,15 @@ private:
     return dflash_model_ != nullptr;
   }
 
-  std::shared_ptr<Mimo2Model> model_;
+std::shared_ptr<Mimo2Model> model_;
   std::uint32_t max_context_;
   bool use_mtp_;
   std::uint32_t max_draft_tokens_;
   std::shared_ptr<const models::mimo2::DFlashV1Model> dflash_model_;
-  std::uint32_t dflash_max_draft_tokens_{7};
+  std::uint32_t dflash_max_draft_tokens_;
   bool distributed_{false};
   std::optional<TextRunnerPersistenceDescriptor> persistence_;
+  cache::Identity component_identity_;
 };
 #endif
 
