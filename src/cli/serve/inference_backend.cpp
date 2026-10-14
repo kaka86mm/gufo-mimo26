@@ -5917,9 +5917,9 @@ bool InferenceBackend::load(std::shared_ptr<models::mimo2::Model> model,
   const bool has_mtp = model->HasMtp();
   try {
     auto new_state = std::make_shared<Impl::State>();
-    // MiMo ships a Qwen2-family tokenizer; the Qwen3.8 sampling defaults are
-    // the closest preset until a MiMo entry exists.
-    new_state->sampling_defaults.model = sampling::TextModelPreset::kQwen38;
+    // The official MiMo-V2.6-Flash-RL generation_config ships do_sample=false
+    // (greedy) with top_p=0.95 for sampled requests.
+    new_state->sampling_defaults.model = sampling::TextModelPreset::kMiMoV26;
     new_state->sampling_defaults.supplied = {};
     std::shared_ptr<const models::mimo2::DFlashV1Model> dflash_model;
     if (speculative_config.backend == TextSpeculativeBackend::kDFlash) {

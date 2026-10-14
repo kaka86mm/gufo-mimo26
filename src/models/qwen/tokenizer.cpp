@@ -466,6 +466,8 @@ std::unique_ptr<QwenTokenizer> QwenTokenizer::CreateFromVocabulary(
 
   tokenizer->endoftext_token_id_ =
       tokenizer->FindSpecialToken(kEndOfText).value_or(kInvalidTokenId);
+  tokenizer->audio_eod_token_id_ =
+      tokenizer->FindSpecialToken(kMimoAudioEod).value_or(kInvalidTokenId);
   tokenizer->eos_token_id_ = tokenizer->FindSpecialToken(kImEnd).value_or(
       tokenizer->endoftext_token_id_);
   tokenizer->bos_token_id_ =

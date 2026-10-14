@@ -8,7 +8,14 @@
 
 namespace gufo::sampling {
 
-enum class TextModelPreset { kUnspecified, kQwen38, kDeepSeekV4Flash };
+enum class TextModelPreset {
+  kUnspecified,
+  kQwen38,
+  kDeepSeekV4Flash,
+  // MiMo-V2.6-Flash-RL: the official generation_config ships
+  // do_sample=false (greedy) with top_p=0.95 for sampled requests.
+  kMiMoV26,
+};
 
 // Presence is independent of value: an explicit zero must override a preset.
 struct SamplingOverrides {
@@ -29,6 +36,12 @@ struct SamplingOverrides {
 };
 
 inline TextModelPreset TextPreset(const core::ModelConfig& config) {
+  // MiMo-V2.6-Flash-RL: 48 layers at 4096 hidden (12 full attention +
+  // 36 sliding-window), an architecture string aliasing the qwen preset,
+  // and a core config whose vocab_size stays at the struct default -- the
+  // qwen38 fingerprint above would otherwise claim it.
+  if (config.num_layers == 48 && config.hidden_size == 4096)
+    return TextModelPreset::kMiMoV26;
   if (config.architecture == "deepseek4")
     return TextModelPreset::kDeepSeekV4Flash;
   if (config.architecture == "qwen4exp" ||
@@ -49,6 +62,12 @@ inline SamplingConfig ResolveTextSampling(TextModelPreset model,
   result.constraint = configured.constraint;
   result.temperature = 1.0F;
   result.top_p = 0.95F;
+  if (model == TextModelPreset::kMiMoV26) {
+    // do_sample=false in the official config: greedy unless the caller
+    // asks to sample, and then with the card's top_p.
+    result.temperature = 0.0F;
+    result.top_k = 0;
+  }
   if (model == TextModelPreset::kQwen38) {
     result.top_k = 20;
     if (!thinking.value_or(true)) {

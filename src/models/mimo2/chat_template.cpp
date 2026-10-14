@@ -16,44 +16,43 @@ void AppendEscaped(std::string& out, std::string_view value) {
 }
 
 std::string RenderToolCall(const ChatMessage::ToolCall& call) {
-  std::string arguments = "{";
-  for (std::size_t i = 0; i < call.arguments.size(); ++i) {
-    const auto& argument = call.arguments[i];
-    if (i != 0) {
-      arguments.append(", ");
-    }
-    arguments.append("\"");
-    arguments.append(argument.name);
-    arguments.append("\": ");
-    arguments.append(argument.is_string ? "\"" : "");
-    arguments.append(argument.value);
-    arguments.append(argument.is_string ? "\"" : "");
+  // The reference template's render_tool_calls: a call replayed in history
+  // carries the same markup the model itself was trained to emit.
+  std::string rendered = "<tool_call><function=";
+  rendered.append(call.name);
+  rendered.push_back('>');
+  for (const auto& argument : call.arguments) {
+    rendered.append("<parameter=");
+    rendered.append(argument.name);
+    rendered.push_back('>');
+    rendered.append(argument.value);
+    rendered.append("</parameter>");
   }
-  arguments.append("}");
-  std::ostringstream rendered;
-  rendered << "{\"name\": \"" << call.name << "\", \"arguments\": "
-           << arguments << ", \"id\": \"" << call.id << "\"}";
-  return rendered.str();
+  rendered.append("</function></tool_call>");
+  return rendered;
 }
 
 std::string RenderTools(std::span<const ChatTool> tools) {
-  std::ostringstream rendered;
-  rendered << "[";
-  for (std::size_t i = 0; i < tools.size(); ++i) {
-    const auto& tool = tools[i];
-    if (i != 0) {
-      rendered << ", ";
-    }
+  // The reference template's render_tools: one tool object per line inside
+  // <tools>...</tools>, introduced by a sentence rather than a bare key.
+  std::string rendered =
+      "You are provided with the following tools:\n\n<tools>";
+  for (const auto& tool : tools) {
+    rendered.push_back('\n');
     if (!tool.definition_json.empty()) {
-      rendered << tool.definition_json;
+      rendered.append(tool.definition_json);
       continue;
     }
-    rendered << "{\"type\": \"function\", \"function\": {\"name\": \""
-             << tool.name << "\", \"description\": \"" << tool.description
-             << "\", \"parameters\": " << tool.parameters_json << "}}";
+    rendered.append("{\"type\": \"function\", \"function\": {\"name\": \"");
+    rendered.append(tool.name);
+    rendered.append("\", \"description\": \"");
+    rendered.append(tool.description);
+    rendered.append("\", \"parameters\": ");
+    rendered.append(tool.parameters_json);
+    rendered.append("}}");
   }
-  rendered << "]";
-  return rendered.str();
+  rendered.append("\n</tools>");
+  return rendered;
 }
 
 void AppendMessage(std::string& out, const ChatMessage& message,
@@ -61,34 +60,34 @@ void AppendMessage(std::string& out, const ChatMessage& message,
   out.append(kImStart);
   out.append(message.role);
   out.push_back('\n');
-  if (message.role == "assistant" && !message.reasoning_content.empty() &&
-      (options.preserve_thinking || options.enable_thinking)) {
-    AppendEscaped(out, message.reasoning_content);
-    out.append(kImEnd);
-    out.push_back('\n');
-  }
-  if (!message.tool_calls.empty()) {
+  if (message.role == "assistant") {
+    // Every assistant turn carries the think block, empty or not: that is the
+    // shape the reference template writes and what this artifact was trained
+    // on. Reasoning is replayed when the client kept it.
+    out.append(" thinking");
+    if (options.preserve_thinking || options.enable_thinking) {
+      AppendEscaped(out, message.reasoning_content);
+    }
+    out.append(" response");
+    AppendEscaped(out, message.content);
     for (const auto& call : message.tool_calls) {
-      out.append("<tool_call>");
       out.append(RenderToolCall(call));
-      out.append("</tool_call>");
-      out.push_back('\n');
     }
   } else {
     AppendEscaped(out, message.content);
-    if (!message.content.empty() || message.role != "tool") {
-      out.push_back('\n');
-    }
   }
   out.append(kImEnd);
-  out.push_back('\n');
 }
 
 }  // namespace
 
 ChatTemplateOptions ResolveMimoChatOptions(const ReasoningOptions& reasoning) {
   ChatTemplateOptions options;
-  options.enable_thinking = reasoning.enabled.value_or(false);
+  // Enabled unless the request turns it off: the model reasons either way,
+  // and only when thinking is declared does the output state machine know
+  // to look for the closer, so reasoning lands in reasoning_content
+  // instead of being emitted as answer text.
+  options.enable_thinking = reasoning.enabled.value_or(true);
   options.preserve_thinking = reasoning.preserve_thinking.value_or(false);
   return options;
 }
@@ -96,6 +95,12 @@ ChatTemplateOptions ResolveMimoChatOptions(const ReasoningOptions& reasoning) {
 std::string_view GenerationPrompt(bool enable_thinking) {
   // The compiled format opens the assistant turn directly; reasoning, when
   // enabled, is produced before the visible content without a marker.
+  //
+  // The reference template pre-closes the block when thinking is off
+  // ("<|im_start|>assistant\n thinking</think>"), but this artifact does not
+  // follow that branch: fed the pre-closure it answers with stray tags
+  // ("<|im_start|>assistant\n>4</thinking>4"), echoes the question, or
+  // reasons anyway. Verified against the artifact, not assumed.
   (void)enable_thinking;
   return "<|im_start|>assistant\n";
 }
@@ -115,12 +120,12 @@ std::string RenderChat(std::span<const ChatMessage> messages,
                        const ChatTemplateOptions& options) {
   std::string out;
   if (!tools.empty()) {
+    // A separate system message, exactly as the reference template renders a
+    // top-level `tools` argument.
     out.append(kImStart);
-    out.append("system\ntools: ");
+    out.append("system\n");
     out.append(RenderTools(tools));
-    out.push_back('\n');
     out.append(kImEnd);
-    out.push_back('\n');
   }
   ChatTemplateOptions effective = options;
   effective.tools_present = !tools.empty();

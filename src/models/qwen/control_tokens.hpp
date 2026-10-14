@@ -23,6 +23,9 @@ inline constexpr std::string_view kVisionEnd = "<|vision_end|>";
 inline constexpr std::string_view kVisionPad = "<|vision_pad|>";
 inline constexpr std::string_view kImagePad = "<|image_pad|>";
 inline constexpr std::string_view kVideoPad = "<|video_pad|>";
+// The official MiMo-V2.6-Flash-RL generation config ends text turns on this
+// multimodal end-of-decode marker as well as <|im_end|>.
+inline constexpr std::string_view kMimoAudioEod = "<|mimo_audio_eod|>";
 
 /// Compose fixed framing without allocation or dynamic initialization.
 template<const std::string_view&... Parts>

@@ -56,8 +56,9 @@ struct ChatTemplateOptions {
 /// The generation prompt that continues an assistant turn.
 [[nodiscard]] std::string_view GenerationPrompt(bool enable_thinking);
 
-/// Renders the compiled MiMo-V2 conversation format (ChatML-family
-/// delimiters, assistant reasoning before the content, JSON tool calls).
+/// Renders the compiled MiMo-V2 conversation format exactly as the reference
+/// template does: think-wrapped assistant turns, XML <function=/<parameter=
+/// tool calls, and the "You are provided with the following tools" preamble.
 [[nodiscard]] std::string RenderChat(std::span<const ChatMessage> messages,
                                      const ChatTemplateOptions& options = {});
 [[nodiscard]] std::string RenderChat(std::span<const ChatMessage> messages,

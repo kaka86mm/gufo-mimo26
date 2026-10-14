@@ -324,12 +324,15 @@ bool ParseContent(const json::Value* content,
 // confusable and invisible characters buy a client nothing.
 // Historical names reach the same renderers unchanged; they describe past
 // output and do not declare a tool the model is allowed to call now.
+// The length cap is 256, not OpenAI's 64: a harness that bridges another
+// system's tools declares the bridged names verbatim (MCP names run past
+// 70 characters), and nothing downstream consumes the length.
 constexpr std::string_view kToolNameRule =
-    "function names require 1-64 printable ASCII characters other than "
+    "function names require 1-256 printable ASCII characters other than "
     "spaces, '<', '>', '\"' and '\\'";
 
 bool RenderableToolName(std::string_view name) {
-  return !name.empty() && name.size() <= 64 &&
+  return !name.empty() && name.size() <= 256 &&
          std::ranges::none_of(name, [](unsigned char c) {
            return c <= 0x20 || c >= 0x7F || c == '<' || c == '>' || c == '"' ||
                   c == '\\';
@@ -1975,6 +1978,11 @@ ParsedGeneration ParseGeneration(
           throw TextGenerationError(
               TextGenerationErrorCode::kToolChoiceUnsatisfied,
               "model did not produce a declared tool call");
+        // No closer and no call: the model answered without running its
+        // reasoning phase, so this text is the answer. Filing it as reasoning
+        // would drop the reply.
+        parsed.reasoning_content.clear();
+        parsed.text = std::string(content);
         return parsed;
       }
       reasoning_call_context = content;
@@ -2147,11 +2155,14 @@ ParsedGeneration ParseStructuredGeneration(
       parsed.reasoning_content = std::string(raw.substr(0, call));
       raw.remove_prefix(call);
     } else {
-      parsed.reasoning_content = std::string(raw.substr(0, end));
-      if (end == std::string_view::npos)
-        return parsed;
-      raw.remove_prefix(end + 8);
-      raw = AfterReasoningSeparator(raw, markers);
+      if (end == std::string_view::npos) {
+        // Without a closer this is a direct answer; keep it as content.
+        parsed.reasoning_content.clear();
+      } else {
+        parsed.reasoning_content = std::string(raw.substr(0, end));
+        raw.remove_prefix(end + 8);
+        raw = AfterReasoningSeparator(raw, markers);
+      }
     }
   }
   const auto content = tool_only ? raw : Trim(raw);
@@ -2584,6 +2595,15 @@ public:
         if (!emitted) {
           return false;
         }
+      }
+      // Ended while still thinking and no closer ever arrived: the model
+      // answered directly, so the text streamed as reasoning is also the
+      // reply. Repeat it as content rather than answering with nothing. When
+      // the final parse kept the text as reasoning (a truncated run that
+      // asked for thinking), the reasoning deltas already stand.
+      if (state_ == State::kThinking && !raw_content_ && !raw_.empty() &&
+          reasoning.empty()) {
+        return Emit(raw_, false);
       }
       return true;
     }

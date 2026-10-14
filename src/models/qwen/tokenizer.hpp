@@ -78,8 +78,14 @@ public:
   [[nodiscard]] TokenId GetBosTokenId() const noexcept { return bos_token_id_; }
   [[nodiscard]] TokenId GetPadTokenId() const noexcept { return pad_token_id_; }
   [[nodiscard]] bool IsStopToken(TokenId token) const noexcept {
+    // A generated <|im_start|> (kept as the BOS id) opens the next turn:
+    // the assistant turn is over. The RL artifact ends short answers this
+    // way instead of emitting <|im_end|>, and without this the whole next
+    // turn leaked into content (2026-10-11). The official generation
+    // config also ends text turns on the multimodal <|mimo_audio_eod|>.
     return token != kInvalidTokenId &&
-           (token == eos_token_id_ || token == endoftext_token_id_);
+           (token == eos_token_id_ || token == endoftext_token_id_ ||
+            token == bos_token_id_ || token == audio_eod_token_id_);
   }
 
   [[nodiscard]] std::optional<TokenId> FindSpecialToken(
@@ -133,6 +139,7 @@ private:
   TokenId bos_token_id_{kInvalidTokenId};
   TokenId eos_token_id_{kInvalidTokenId};
   TokenId endoftext_token_id_{kInvalidTokenId};
+  TokenId audio_eod_token_id_{kInvalidTokenId};
   TokenId pad_token_id_{kInvalidTokenId};
   PreTokenizer pre_tokenizer_{PreTokenizer::kNone};
 };
