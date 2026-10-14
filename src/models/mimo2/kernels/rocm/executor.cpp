@@ -250,7 +250,12 @@ bool UsesRoutedCompact(const DeviceLayer& l, std::uint32_t n_tokens) {
 /// Key-tile splits per row of a narrow attention batch (decode at depth).
 constexpr std::uint32_t kAttnSplits = 8;
 /// Upper bound on the split count; sizes the per-row partial buffer.
-constexpr std::uint32_t kAttnSplitsMax = 32;
+/// Raised from 32 for the long-context experiment: at 100K+ the shared form
+/// wants one split per eight keys, and the old cap left each block walking
+/// thousands of keys serially (150K measured ~4.4ms per layer against
+/// 0.83ms at 65K). The scratch this sizes is 16 rows x q-heads x cap x
+/// (d_v + 2) floats: 34 MiB at 64.
+constexpr std::uint32_t kAttnSplitsMax = 64;
 
 /// Whether the decode attention reads the int8 K/V twin. The fp16 rows stay
 /// authoritative (the prefill tiles read them), so this only changes the

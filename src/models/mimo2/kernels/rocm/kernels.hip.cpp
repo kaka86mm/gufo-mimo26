@@ -4007,8 +4007,10 @@ __global__ void MimoAttentionKernel(
 constexpr std::uint32_t kMimoSharedStage = 32;
 
 /// Ceiling on the shared-KV split count: the merge cost grows linearly with
-/// it and the executor's partials scratch is sized for the same cap.
-constexpr std::uint32_t kAttnSplitsCap = 32;
+/// it and the executor's partials scratch is sized for the same cap. Raised
+/// with kAttnSplitsMax (they must agree) so deep contexts can spread a row's
+/// key range over more blocks.
+constexpr std::uint32_t kAttnSplitsCap = 64;
 
 /// Shared-KV decode attention for the global layers (window == 0).
 ///
