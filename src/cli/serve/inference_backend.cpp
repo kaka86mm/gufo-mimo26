@@ -5597,7 +5597,8 @@ bool InferenceBackend::load(const std::string& model_path, std::string* error,
     }
     return load(std::move(model), error, max_context, session_count,
                 prefill_policy, scheduler_policy, speculative_config,
-                std::move(resolved_disk_cache_config), tp_config);
+                std::move(resolved_disk_cache_config), tp_config,
+                ram_cache_config);
   }
   std::shared_ptr<models::qwen::vision::Encoder> vision;
   try {
@@ -6024,10 +6025,13 @@ bool InferenceBackend::load(
       }
       std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
       if (DiskCacheEnabled(disk_cache_config)) {
+        const auto disk_overrides = DiskCheckpointOverridesFromEnv();
         runner_disk_cache = TextRunnerDiskCacheOptions{
             .directory = std::move(disk_cache_config.directory),
             .capacity_bytes = disk_cache_config.capacity_bytes,
             .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+            .shared_prefix_max_boundaries = disk_overrides.shared_boundaries,
+            .min_checkpoint_step_tokens = disk_overrides.min_step,
         };
       }
       auto runner_pool = std::make_shared<TextRunnerPool>(
@@ -6060,7 +6064,8 @@ bool InferenceBackend::load(std::shared_ptr<models::mimo2::Model> model,
                             TextSchedulerPolicy scheduler_policy,
                             TextSpeculativeConfig speculative_config,
                             TextDiskCacheConfig disk_cache_config,
-                            const TextTpConfig& tp_config) {
+                            const TextTpConfig& tp_config,
+                            TextRunnerRamCacheOptions ram_cache_config) {
   if (model == nullptr) {
     SetError(error, "MiMo model must not be null");
     return false;
@@ -6230,14 +6235,18 @@ bool InferenceBackend::load(std::shared_ptr<models::mimo2::Model> model,
       }
       std::optional<TextRunnerDiskCacheOptions> runner_disk_cache;
       if (DiskCacheEnabled(disk_cache_config)) {
+        const auto disk_overrides = DiskCheckpointOverridesFromEnv();
         runner_disk_cache = TextRunnerDiskCacheOptions{
             .directory = std::move(disk_cache_config.directory),
             .capacity_bytes = disk_cache_config.capacity_bytes,
             .staging_capacity_bytes = disk_cache_config.staging_capacity_bytes,
+            .shared_prefix_max_boundaries = disk_overrides.shared_boundaries,
+            .min_checkpoint_step_tokens = disk_overrides.min_step,
         };
       }
       auto runner_pool = std::make_shared<TextRunnerPool>(
-          std::move(pool_runner), session_count, std::move(runner_disk_cache));
+          std::move(pool_runner), session_count, std::move(runner_disk_cache),
+          ram_cache_config);
       new_state->scheduler = std::make_shared<TextGenerationScheduler>(
           std::move(runner_pool), prefill_policy, scheduler_policy);
     }

@@ -149,7 +149,8 @@ public:
             TextSchedulerPolicy scheduler_policy = {},
             TextSpeculativeConfig speculative_config = {},
             TextDiskCacheConfig disk_cache_config = {},
-            const TextTpConfig& tp_config = {});
+            const TextTpConfig& tp_config = {},
+            TextRunnerRamCacheOptions ram_cache_config = {});
 
   /// Runs the rank-1 TP2 worker loop until the control channel closes.
   [[nodiscard]] bool run_worker(std::string* error);
