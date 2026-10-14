@@ -165,8 +165,10 @@ ContinuationAdapter::ContinuationAdapter(std::shared_ptr<Model> model,
   for (std::uint32_t il = 0; il < config.num_layers; ++il)
     layer_components(il, Part::kLayerK, Part::kLayerV, il);
   if (has_mtp_) {
-    for (std::uint32_t j = 0; j < config.nextn_layers; ++j)
-      layer_components(config.num_layers + j, Part::kMtpK, Part::kMtpV, j);
+    // Only the first block runs the draft chain; the dormant ones hold
+    // position zero and contribute no snapshot bytes, so they get no row
+    // components at all.
+    layer_components(config.num_layers, Part::kMtpK, Part::kMtpV, 0);
     for (std::uint32_t j = 0; j < config.nextn_layers; ++j)
       push(Part::kMtpResidual, cache::ComponentKind::kPrivateState, 0,
            std::size_t{hidden_size_} * sizeof(float), j);
