@@ -626,6 +626,13 @@ TextRunnerResourceClaim TpMirroredRunner::ResourceClaim() const {
   auto claim = inner_->ResourceClaim();
   claim.retained_snapshot_capacity_bytes = std::min(
       claim.retained_snapshot_capacity_bytes.value_or(0), snapshot_budget_);
+  // An explicit cache limit selects its capacity from the ceiling, so the
+  // ceiling must respect the worker budget too or rank 0 would retain more
+  // than rank 1 can hold and captures would fail at the boundary.
+  if (claim.retained_snapshot_ceiling_bytes.has_value()) {
+    claim.retained_snapshot_ceiling_bytes =
+        std::min(*claim.retained_snapshot_ceiling_bytes, snapshot_budget_);
+  }
   return claim;
 }
 

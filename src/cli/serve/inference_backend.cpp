@@ -104,6 +104,19 @@ struct DiskCheckpointOverrides {
   return values;
 }
 
+/// Snapshot bytes each TP rank may hold for the pair. The handshake takes the
+/// minimum of both ranks' values, and the worker enforces it as a hard cap; an
+/// explicit --cache-ram-bytes must raise this budget together with the local
+/// pool, bounded by the same host ceiling the pool clamps an explicit limit
+/// to.
+[[nodiscard]] std::size_t TpSnapshotBudgetBytes(
+    const TextRunnerRamCacheOptions& options) {
+  const std::size_t requested = options.capacity_bytes != 0
+                                    ? options.capacity_bytes
+                                    : HostSnapshotBudgetBytes();
+  return std::min(requested, HostSnapshotCeilingBytes());
+}
+
 using Clock = std::chrono::steady_clock;
 
 void SetError(std::string* error, std::string message) {
@@ -5959,7 +5972,7 @@ bool InferenceBackend::load(
         session_count + scheduler_policy.max_pending_requests;
     if (tp_world_size > 1) {
       const TpControlConfig control_config{
-          .snapshot_budget_bytes = HostSnapshotBudgetBytes(),
+          .snapshot_budget_bytes = TpSnapshotBudgetBytes(ram_cache_config),
           .rank = tp_rank,
           .world_size = tp_world_size,
           .max_context = max_context,
@@ -6169,7 +6182,7 @@ bool InferenceBackend::load(std::shared_ptr<models::mimo2::Model> model,
         session_count + scheduler_policy.max_pending_requests;
     if (tp_world_size > 1) {
       const TpControlConfig control_config{
-          .snapshot_budget_bytes = HostSnapshotBudgetBytes(),
+          .snapshot_budget_bytes = TpSnapshotBudgetBytes(ram_cache_config),
           .rank = tp_rank,
           .world_size = tp_world_size,
           .max_context = max_context,
