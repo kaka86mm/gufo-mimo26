@@ -589,8 +589,10 @@ bool ParseTools(const json::Value* tools,
     tool.definition_json = definition.dump();
     // Counted per flattened function, so namespace recursion cannot exceed
     // the cap by ordering hosted-adjacent entries around a full namespace.
-    if (output->size() >= 128) {
-      *error = "'tools' supports at most 128 functions";
+    // 1024 matches the serving line this tree ports (MCP-heavy clients send
+    // well over a hundred tools); upstream's 128 rejects every such request.
+    if (output->size() >= 1024) {
+      *error = "'tools' supports at most 1024 functions";
       return false;
     }
     output->push_back(std::move(tool));
