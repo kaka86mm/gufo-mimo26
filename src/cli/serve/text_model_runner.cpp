@@ -15,6 +15,7 @@
 #include "src/cli/serve/component_text_cache.hpp"
 #include "src/cli/serve/continuation_disk_store.hpp"
 #include "src/cli/serve/logging.hpp"
+#include "src/cli/serve/tool_serving.hpp"
 #include "src/core/json.hpp"
 
 namespace gufo::server {
@@ -32,6 +33,10 @@ std::optional<ChatRequest> ConstrainChatRequest(
        request.tool_choice == ChatRequest::ToolChoice::kNone))
     return std::nullopt;
   auto constrained = request;
+  // Free-form tool serving: nothing to constrain, so decoding keeps the
+  // plain (and TP2-mirrorable) fast path.
+  if (ToolsServedFreeform() && !request.response_format)
+    return constrained;
   auto instruction = request.response_format ? request.response_format->prompt()
                                              : std::string();
   auto grammar = request.response_format;

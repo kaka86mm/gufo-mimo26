@@ -1325,7 +1325,11 @@ struct TextGenerationScheduler::Impl {
     const auto piece = request->stop_filter.enabled()
                            ? request->stop_filter.Push(selection.piece)
                            : selection.piece;
-    if ((!piece.empty() || !request->stop_filter.enabled()) &&
+    // An empty piece is either a token with no text (still published, so
+    // per-token cadence and the output budget hold) or bytes a stop filter
+    // withheld mid-sequence (published as nothing).
+    if ((!piece.empty() || !request->stop_filter.enabled() ||
+         selection.piece.empty()) &&
         !PublishPiece(request, piece)) {
       CompleteFailure(request,
                       std::make_exception_ptr(TextGenerationError(
@@ -1336,8 +1340,12 @@ struct TextGenerationScheduler::Impl {
     if (incremental_text_is_exact) {
       request->result.text += piece;
     }
-    if (request->stop_filter.stopped())
+    if (request->stop_filter.stopped()) {
       request->result.stop_sequence = request->stop_filter.matched_sequence();
+      request->result.repeat_guard = request->stop_filter.repetition_detected();
+      request->result.foreign_stop =
+          request->stop_filter.foreign_stop_detected();
+    }
     if (CompleteIfStopped(request)) {
       return false;
     }

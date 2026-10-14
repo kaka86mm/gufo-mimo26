@@ -203,6 +203,11 @@ public:
     std::size_t completion_tokens{0};
     /// Generated reasoning tokens, excluding the closing template delimiter.
     std::size_t reasoning_tokens{0};
+    /// Set when the repeat guard ended the request (see StopSequenceFilter).
+    bool repeat_guard{false};
+    /// Set when the foreign-token stop ended the request (see
+    /// StopSequenceFilter).
+    bool foreign_stop{false};
     /// Number of speculative verification rounds actually executed.
     std::size_t draft_rounds{0};
     std::size_t draft_tokens{0};

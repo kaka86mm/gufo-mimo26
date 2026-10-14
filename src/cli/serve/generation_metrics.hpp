@@ -162,6 +162,12 @@ inline std::string GenerationLogDetails(
       << " draft_accepted=" << result.draft_accepted_tokens
       << " draft_proposed=" << result.draft_tokens
       << " draft_rounds=" << result.draft_rounds;
+  if (result.repeat_guard) {
+    out << " repeat_guard=1";
+  }
+  if (result.foreign_stop) {
+    out << " foreign_stop=1";
+  }
   if (result.component_cache)
     out << " cache_schema=component-cache-v1 cache_reuse="
         << result.component_cache->reuse

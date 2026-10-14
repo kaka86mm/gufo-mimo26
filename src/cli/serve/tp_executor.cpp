@@ -634,6 +634,15 @@ std::vector<TextExecutionPlan> TpMirroredRunner::SupportedPlans() const {
   return inner_->SupportedPlans();
 }
 
+std::shared_ptr<const sampling::ConstraintVocabulary>
+TpMirroredRunner::BuildConstraintVocabulary() const {
+  return inner_->BuildConstraintVocabulary();
+}
+
+sampling::JsonConstraint::ToolFormat TpMirroredRunner::ToolFormat() const {
+  return inner_->ToolFormat();
+}
+
 std::vector<TextRunnerToken> TpMirroredRunner::Tokenize(
     std::string_view text) const {
   return inner_->Tokenize(text);

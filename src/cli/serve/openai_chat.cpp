@@ -26,6 +26,7 @@
 #include "src/cli/serve/response_format.hpp"
 #include "src/cli/serve/sampling_request.hpp"
 #include "src/cli/serve/stop_sequences.hpp"
+#include "src/cli/serve/tool_serving.hpp"
 #include "src/core/image.hpp"
 #include "src/core/json.hpp"
 #include "src/core/utf8.hpp"
@@ -81,10 +82,14 @@ struct ParsedGeneration {
   bool hide_tool_markup{false};
 };
 
-constexpr std::array<std::string_view, 7> kToolMarkers{
+constexpr std::array<std::string_view, 8> kToolMarkers{
     "<tool_call>",          "<｜DSML｜tool_calls｜>", "<｜DSML｜tool_calls>",
     "<DSML｜tool_calls｜>", "<DSML｜tool_calls>",     "<tool_calls｜>",
     "<tool_calls>",
+    // The Claude/Anthropic envelope this artifact also emits in the wild:
+    // <function_calls><invoke name=...>. Seen live, unparsed, leaking into
+    // reasoning (2026-10-10).
+    "<function_calls>",
 };
 using ToolMarkerSet = std::span<const std::string_view>;
 
@@ -132,7 +137,7 @@ constexpr std::array<std::string_view, 4> kQwenClosers{
     // The client's envelope, whose block rules already strip it whole.
     "</invoke>",
 };
-constexpr std::array<std::string_view, 9> kToolClosers{
+constexpr std::array<std::string_view, 10> kToolClosers{
     // Qwen family.
     "</parameter>",
     "</function>",
@@ -142,6 +147,7 @@ constexpr std::array<std::string_view, 9> kToolClosers{
     "</invoke>",
     "</function_results>",
     "</tool_calls>",
+    "</function_calls>",
     // Model-native dialects, which this fallback admits like any other opener.
     "</｜DSML｜parameter>",
     "</｜DSML｜invoke>",
@@ -338,6 +344,30 @@ bool RenderableToolName(std::string_view name) {
                   c == '\\';
          });
 }
+
+// Drifted dialects namespace a declared tool's name ("functions.WebSearch").
+// The declared spelling is what this request admits and history replays, so
+// lookups resolve through the namespace and calls report the declared name.
+std::string_view StripToolNamespace(std::string_view name) {
+  constexpr std::string_view kToolNamespace = "functions.";
+  if (name.size() > kToolNamespace.size() &&
+      name.starts_with(kToolNamespace)) {
+    return name.substr(kToolNamespace.size());
+  }
+  return name;
+}
+
+const tokenization::ChatTool* FindDeclaredTool(
+    std::span<const tokenization::ChatTool> tools, std::string_view name) {
+  name = StripToolNamespace(name);
+  for (const auto& tool : tools) {
+    if (std::string_view(tool.name) == name) {
+      return &tool;
+    }
+  }
+  return nullptr;
+}
+
 
 bool ParseArguments(std::string_view arguments,
                     std::vector<tokenization::ChatMessage::ToolArgument>* out,
@@ -758,7 +788,8 @@ std::optional<HttpResponse> ParseToolControls(const json::Value& body,
         false;  // Forced functions execute exactly once.
   output->chat.constrained_tools =
       !output->chat.tools.empty() &&
-      output->chat.tool_choice != ChatRequest::ToolChoice::kNone;
+      output->chat.tool_choice != ChatRequest::ToolChoice::kNone &&
+      !ToolsServedFreeform();
 
   return {};
 }
@@ -1196,9 +1227,7 @@ bool DeclaredEnvelope(std::string_view tag,
     return false;
   const auto end = value.find(value.front(), 1);
   return end != std::string_view::npos &&
-         std::ranges::any_of(tools, [&](const auto& tool) {
-           return tool.name == value.substr(1, end - 1);
-         });
+         FindDeclaredTool(tools, value.substr(1, end - 1)) != nullptr;
 }
 
 // Find a closed or truncated client envelope whose request context identifies
@@ -1482,11 +1511,41 @@ std::string_view BeforePartialDelimiter(std::string_view value,
   return value;
 }
 
+/// Length of the leading run of closer-shaped tags in `text` ("</name>",
+/// possibly several, separated by whitespace), or 0 when the run is empty or
+/// something else interrupts it. The artifact invents closer spellings of its
+/// own ("</function_call>", seen in production on 2026-10-10), so a tail that
+/// is nothing but tags is framing rather than argument data.
+std::size_t CloserTagRun(std::string_view text) {
+  std::size_t position = 0;
+  while (position + 2 < text.size() &&
+         text.substr(position).starts_with("</")) {
+    const auto close = text.find('>', position + 2);
+    if (close == std::string_view::npos)
+      break;
+    const auto name = Trim(text.substr(position + 2, close - position - 2));
+    if (name.empty())
+      break;
+    for (const char byte : name) {
+      const auto letter = static_cast<unsigned char>(byte);
+      if (std::isalnum(letter) == 0 && byte != '_' && byte != '-' &&
+          byte != '.' && byte != ':')
+        return 0;
+    }
+    position = close + 1;
+    while (position < text.size() &&
+           std::isspace(static_cast<unsigned char>(text[position])) != 0)
+      ++position;
+  }
+  return position;
+}
+
 void ParseQwenCalls(
     std::string_view text, std::span<const tokenization::ChatTool> tools,
     std::vector<ParsedToolCall>* calls,
     std::vector<std::pair<std::size_t, std::size_t>>* spans = nullptr,
-    bool require_schema = false, bool partial = false) {
+    bool require_schema = false, bool partial = false,
+    bool stopped_cleanly = true) {
   constexpr std::string_view start = "<tool_call>";
   constexpr std::string_view end = "</tool_call>";
   QuoteTracker call_quotes;
@@ -1522,11 +1581,9 @@ void ParseQwenCalls(
       call.name = std::string(Trim(body.substr(0, name_end)));
       body.remove_prefix(name_end + 1);
       std::optional<json::Value> schema;
-      for (const auto& tool : tools) {
-        if (tool.name == call.name) {
-          schema = TryParseJson(tool.parameters_json);
-          break;
-        }
+      if (const auto* declared = FindDeclaredTool(tools, call.name)) {
+        call.name = declared->name;
+        schema = TryParseJson(declared->parameters_json);
       }
       if (call.name.empty())
         continue;
@@ -1662,7 +1719,37 @@ void ParseQwenCalls(
         }
         body.remove_prefix(close + std::string_view{"</parameter>"}.size());
       }
-      complete = valid && consume("</function>") && consume(end);
+      if (valid) {
+        const bool function_closed = consume("</function>");
+        if (function_closed) {
+          // A call that ends the message may miss its final closer; the
+          // parameters are complete, so nothing is ambiguous.
+          complete = consume(end) || Trim(body).empty();
+        } else if (consume(end)) {
+          complete = true;
+        } else {
+          // The artifact also closes a call with a tag of its own invention
+          // ("</function_call>", seen in production on 2026-10-10), and a
+          // generation that stops inside the envelope ends right after the
+          // parameters. The parameters are complete either way, so a tail
+          // that is nothing but closer-shaped tags, or nothing at all, is
+          // framing rather than argument data. An empty tail on a run that
+          // was truncated proves nothing: it may have been cut before the
+          // parameters even started, so only a clean stop completes there.
+          const auto tail = Trim(body);
+          if (tail.empty()) {
+            complete = stopped_cleanly;
+          } else {
+            const std::size_t closer = CloserTagRun(tail);
+            if (closer > 0) {
+              body.remove_prefix(static_cast<std::size_t>(tail.data() -
+                                                          body.data()) +
+                                 closer);
+              complete = true;
+            }
+          }
+        }
+      }
     } else {
       // Recovery boundaries belong to the envelope, not quoted JSON data.
       // An unfinished string owns the remaining bytes, including tool tags.
@@ -1694,6 +1781,9 @@ void ParseQwenCalls(
         const auto parsed = TryParseJson(Trim(body.substr(0, close)));
         if (parsed && parsed->is_object()) {
           call.name = parsed->member_str("name");
+          if (const auto* declared_tool = FindDeclaredTool(tools, call.name)) {
+            call.name = declared_tool->name;
+          }
           const auto* arguments = parsed->find("arguments");
           if (!call.name.empty() && arguments && arguments->is_object()) {
             for (const auto& [name, value] : arguments->members())
@@ -1708,15 +1798,13 @@ void ParseQwenCalls(
       }
     }
     if (complete && !tools.empty() &&
-        std::ranges::none_of(
-            tools, [&](const auto& tool) { return tool.name == call.name; }))
+        FindDeclaredTool(tools, call.name) == nullptr)
       complete = false;
     if (complete && (require_schema || call_quotes.UnclosedAt(marker_begin))) {
       // An unfinished quotation is ambiguous. Restore the legacy fallback only
       // for a declared call whose complete arguments satisfy its schema.
-      const auto tool =
-          std::ranges::find(tools, call.name, &tokenization::ChatTool::name);
-      if (tool == tools.end()) {
+      const auto* tool = FindDeclaredTool(tools, call.name);
+      if (tool == nullptr) {
         complete = false;
       } else {
         try {
@@ -1763,34 +1851,76 @@ std::optional<std::string> Attribute(std::string_view tag,
   return std::string(tag.substr(value_start, end - value_start));
 }
 
+// The invoke-shaped openers a drifted call is spelled with (DSML dialects,
+// the plain <invoke>, and the antml: namespace).
+constexpr std::array<std::string_view, 6> kInvokeStarts{
+    "<｜DSML｜invoke", "<DSML｜invoke", "<｜DS｜invoke",
+    "<DS｜invoke",     "<invoke",       "<antml:invoke",
+};
+
+// The earliest invoke-shaped tag at or after `from` that names a tool this
+// request declares. A bare invocation outside an envelope is prose -- that is
+// what keeps documentation safe -- but a drifted call names a declared tool
+// (2026-10-10: an unparsed <invoke name="Bash"> leaked as a subagent's final
+// answer and poisoned its parent context).
+std::size_t FirstDeclaredBareInvoke(
+    std::string_view text, std::span<const tokenization::ChatTool> tools,
+    QuoteTracker* quotes, std::size_t from = 0) {
+  for (std::size_t position = from; position < text.size();) {
+    std::size_t found = std::string_view::npos;
+    for (const auto start : kInvokeStarts) {
+      const auto at = text.find(start, position);
+      if (at < found) {
+        found = at;
+      }
+    }
+    if (found == std::string_view::npos) {
+      return std::string_view::npos;
+    }
+    if (quotes == nullptr || !quotes->QuotedAt(found)) {
+      const auto tag_end = text.find('>', found);
+      if (tag_end != std::string_view::npos) {
+        const auto name =
+            Attribute(text.substr(found, tag_end - found), "name");
+        if (name && FindDeclaredTool(tools, *name) != nullptr) {
+          return found;
+        }
+      }
+    }
+    position = found + 1;
+  }
+  return std::string_view::npos;
+}
+
 void ParseDsmlCalls(
     std::string_view text, ToolMarkerSet markers,
     std::vector<ParsedToolCall>* calls,
     std::vector<std::pair<std::size_t, std::size_t>>* spans = nullptr,
-    bool partial = false) {
-  constexpr std::array<std::string_view, 4> kInvokeStarts{
-      "<｜DSML｜invoke",
-      "<DSML｜invoke",
-      "<｜DS｜invoke",
-      "<DS｜invoke",
-  };
-  constexpr std::array<std::string_view, 4> kInvokeEnds{
+    bool partial = false,
+    std::span<const tokenization::ChatTool> tools = {}) {
+  constexpr std::array<std::string_view, 6> kInvokeEnds{
       "</｜DSML｜invoke>",
       "</DSML｜invoke>",
       "</｜DS｜invoke>",
       "</DS｜invoke>",
+      "</invoke>",
+      "</antml:invoke>",
   };
-  constexpr std::array<std::string_view, 4> kParameterStarts{
+  constexpr std::array<std::string_view, 6> kParameterStarts{
       "<｜DSML｜parameter",
       "<DSML｜parameter",
       "<｜DS｜parameter",
       "<DS｜parameter",
+      "<parameter",
+      "<antml:parameter",
   };
-  constexpr std::array<std::string_view, 4> kParameterEnds{
+  constexpr std::array<std::string_view, 6> kParameterEnds{
       "</｜DSML｜parameter>",
       "</DSML｜parameter>",
       "</｜DS｜parameter>",
       "</DS｜parameter>",
+      "</parameter>",
+      "</antml:parameter>",
   };
 
   std::size_t cursor = 0;
@@ -1821,9 +1951,25 @@ void ParseDsmlCalls(
             opening = marker;
           }
         }
-        // Bare invocation examples outside an outer envelope are prose.
-        if (begin == std::string_view::npos)
-          break;
+        if (begin == std::string_view::npos) {
+          // Bare invocation examples outside an outer envelope are prose --
+          // unless the invocation names a tool this request declares. The
+          // model drifts to exactly that spelling under load (2026-10-10: an
+          // unparsed <invoke name="Bash"> became a subagent's final answer
+          // and poisoned its parent context), while documentation names
+          // nothing declared.
+          const auto bare =
+              tools.empty() || !ToolsServedFreeform()
+                  ? std::string_view::npos
+                  : FirstDeclaredBareInvoke(text, tools, nullptr, cursor);
+          if (bare == std::string_view::npos) {
+            break;
+          }
+          envelope_begin = bare;
+          envelope_end.clear();
+          cursor = bare;
+          continue;
+        }
         envelope_begin = begin;
         envelope_end =
             "</" + std::string(opening.substr(opening.find('<') + 1));
@@ -2043,7 +2189,13 @@ ParsedGeneration ParseGeneration(
   }
 
   quotes.Reset(parsed.text);
-  const std::size_t marker = EarliestMarker(parsed.text, markers, quotes);
+  std::size_t marker = EarliestMarker(parsed.text, markers, quotes);
+  if (marker == std::string_view::npos && recognize_tools &&
+      ToolsServedFreeform()) {
+    // No envelope marker: a bare invoke naming a declared tool still routes
+    // to the parsers, the dialect the model drifts into under load.
+    marker = FirstDeclaredBareInvoke(parsed.text, tools, &quotes);
+  }
   if (choice != ChatRequest::ToolChoice::kNone && !tools.empty() &&
       marker != std::string_view::npos) {
     if (partial && (unfinished_reasoning_quote || quotes.UnclosedAt(marker)))
@@ -2055,14 +2207,14 @@ ParsedGeneration ParseGeneration(
     // an additional API invocation.
     if (text_from_tools.starts_with("<tool_call>"))
       ParseQwenCalls(parsed.text, tools, &parsed.tool_calls, nullptr,
-                     unfinished_reasoning_quote, partial);
+                     unfinished_reasoning_quote, partial, enforce_required);
     else
       ParseDsmlCalls(
           text_from_tools, markers, &parsed.tool_calls, &spans,
-          partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker));
+          partial && !unfinished_reasoning_quote && !quotes.UnclosedAt(marker),
+          tools);
     std::erase_if(parsed.tool_calls, [&](const auto& call) {
-      return std::ranges::none_of(
-          tools, [&](const auto& tool) { return tool.name == call.name; });
+      return FindDeclaredTool(tools, call.name) == nullptr;
     });
     if (parsed.tool_calls.empty() && unfinished_reasoning_quote &&
         choice != ChatRequest::ToolChoice::kRequired) {
@@ -2087,7 +2239,26 @@ ParsedGeneration ParseGeneration(
     }
     // An explicit stop can interrupt a call before its closing tags. Keep
     // complete calls, but do not expose an unfinished call as ordinary text.
-    if (!parsed.tool_calls.empty() || !enforce_required) {
+    if (parsed.tool_calls.empty()) {
+      // The opener was recognized but no complete call followed: the model
+      // wrote something call-shaped this server could not read. Keep the turn
+      // as prose, framing closers removed, rather than dropping everything
+      // after the opener -- an agent harness stalls on an emptied turn.
+      std::string full = std::move(parsed.text);
+      const auto block = EnvelopeBlockStart(full, full.size(), 0, closers,
+                                            tools, false, quotes);
+      // Cut at the envelope the request can name, or at the marker that
+      // opened it, whichever comes first: a declared but unreadable call is
+      // markup the stream already hid, while an undeclared example stays
+      // prose. The deltas and the final text must agree either way.
+      const auto stop =
+          std::min(marker, block == std::string_view::npos
+                               ? full.size()
+                               : block);
+      parsed.text =
+          std::string(ContentBefore(full, 0, stop, closers, quotes, tools));
+      parsed.hide_tool_markup = block != std::string_view::npos;
+    } else {
       // Text outside complete envelopes is content. Framing echoed directly
       // after a call is removed, as for Qwen calls (#383).
       const std::string full = std::move(parsed.text);
@@ -2193,7 +2364,8 @@ ParsedGeneration ParseStructuredGeneration(
     ParsedGeneration call;
     std::vector<std::pair<std::size_t, std::size_t>> spans;
     ParseQwenCalls(content, tools, &call.tool_calls,
-                   tool_only ? &spans : nullptr, false, partial);
+                   tool_only ? &spans : nullptr, false, partial,
+                   enforce_required);
     if (tool_only) {
       std::size_t cursor = 0;
       for (const auto& [begin, end] : spans) {
@@ -2377,6 +2549,28 @@ json::Value ChoiceChunk(std::string_view id, long long created,
   return chunk;
 }
 
+// Bytes a tool-mode hold may accumulate before flushing as prose. On unless
+// GUFO_HIDDEN_FLUSH_BYTES=0. The cap must vent a held envelope well inside a
+// client's zero-byte body timeout: deep-context decode runs near 15 t/s
+// (~60 B/s), so 8 KiB flushes about every two minutes -- 32 KiB held silence
+// for five-plus minutes and the 2026-10-11 research session timed out twice
+// mid-generation.
+std::size_t HiddenFlushBytes() {
+  static const std::size_t bytes = [] {
+    const char* value = std::getenv("GUFO_HIDDEN_FLUSH_BYTES");
+    if (value == nullptr || value[0] == '\0') {
+      return std::size_t{8192};
+    }
+    char* end = nullptr;
+    const unsigned long parsed = std::strtoul(value, &end, 10);
+    if (end == nullptr || *end != '\0') {
+      return std::size_t{8192};
+    }
+    return static_cast<std::size_t>(parsed);
+  }();
+  return bytes;
+}
+
 class StreamingTextFilter {
 public:
   using EmitCallback =
@@ -2393,7 +2587,8 @@ public:
         recognize_tools_(recognize_tools),
         markers_(markers),
         closers_(closers),
-        tools_(tools) {
+        tools_(tools),
+        hidden_flush_bytes_(HiddenFlushBytes()) {
     if (initial_output_state ==
         TextGenerationBackend::InitialOutputState::kReasoning) {
       state_ = State::kThinking;
@@ -2410,6 +2605,16 @@ public:
     quotes_.Append(piece);
     if (tool_mode_) {
       hidden_.append(piece);
+      // A drifted envelope that never completes would hide output until the
+      // client's own body timeout (2026-10-10: subagent calls starved at
+      // 300s+ of zero bytes). Past the cap the held bytes flow as prose;
+      // final parsing still decides the authoritative message.
+      if (hidden_flush_bytes_ > 0 && hidden_.size() > hidden_flush_bytes_) {
+        if (!Emit(hidden_, false)) {
+          return false;
+        }
+        hidden_.clear();
+      }
       return true;
     }
     pending_.append(piece);
@@ -2462,11 +2667,15 @@ public:
                                       : think_found - offset;
       const auto thinking_markers =
           raw_content_ ? ReasoningToolMarkers(markers_) : markers_;
-      const auto found =
+      auto found =
           !recognize_tools_ ? std::string::npos
           : raw_content_
               ? ReasoningToolMarker(raw_, thinking_markers, quotes_, offset)
               : EarliestMarker(raw_, thinking_markers, quotes_, offset);
+      if (found == std::string_view::npos && recognize_tools_ &&
+          !raw_content_ && ToolsServedFreeform()) {
+        found = FirstDeclaredBareInvoke(raw_, tools_, &quotes_, offset);
+      }
       const std::size_t marker =
           found == std::string::npos ? std::string::npos : found - offset;
       if (marker < end_pos) {
@@ -2523,9 +2732,13 @@ public:
         return StructuredContent();
       }
       const auto offset = pending_offset();
-      const auto found = recognize_tools_
+      auto found = recognize_tools_
                              ? EarliestMarker(raw_, markers_, quotes_, offset)
                              : std::string_view::npos;
+      if (found == std::string_view::npos && recognize_tools_ &&
+          ToolsServedFreeform()) {
+        found = FirstDeclaredBareInvoke(raw_, tools_, &quotes_, offset);
+      }
       const std::size_t marker =
           found == std::string::npos ? std::string::npos : found - offset;
       if (marker != std::string::npos) {
@@ -2693,6 +2906,7 @@ private:
   std::string raw_;
   std::string pending_;
   std::string hidden_;
+  std::size_t hidden_flush_bytes_{32768};
   State state_{State::kInitial};
   bool tool_mode_{false};
   bool raw_content_{false};
@@ -3432,6 +3646,7 @@ std::optional<HttpResponse> ParseOpenAiResponseControls(const json::Value& body,
       function["strict"] = true;
       tool.parameters_json = function.find("parameters")->dump();
       parsed.chat.constrained_tools |=
+          !ToolsServedFreeform() &&
           parsed.chat.tool_choice != ChatRequest::ToolChoice::kNone;
     } catch (const std::invalid_argument&) {
       function["strict"] = false;

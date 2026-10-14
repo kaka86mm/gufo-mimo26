@@ -4140,6 +4140,13 @@ public:
         });
   }
 
+  // MiMo's compiled template wraps calls in <tool_call>...</tool_call>
+  // with {"name": ..., "arguments": {...}} inside: the Qwen shape, and
+  // the shape the serve parser already extracts.
+  [[nodiscard]] sampling::JsonConstraint::ToolFormat ToolFormat() const override {
+    return sampling::JsonConstraint::ToolFormat::kQwen;
+  }
+
   [[nodiscard]] std::vector<TextRunnerToken> Tokenize(
       std::string_view text) const override {
     return model_->tokenizer().Encode(text);
