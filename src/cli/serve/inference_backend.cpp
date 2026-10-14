@@ -107,14 +107,15 @@ struct DiskCheckpointOverrides {
 /// Snapshot bytes each TP rank may hold for the pair. The handshake takes the
 /// minimum of both ranks' values, and the worker enforces it as a hard cap; an
 /// explicit --cache-ram-bytes must raise this budget together with the local
-/// pool, bounded by the same host ceiling the pool clamps an explicit limit
-/// to.
+/// pool. An explicit value is taken verbatim: the availability-derived budget
+/// and ceiling swing by several GiB while the model loads (MemAvailable minus
+/// CmaFree churns with the kernel's KHO scratch accounting) and a sampled
+/// ceiling can even compute zero and stall every capture, so sizing an
+/// explicit limit from them is not deterministic.
 [[nodiscard]] std::size_t TpSnapshotBudgetBytes(
     const TextRunnerRamCacheOptions& options) {
-  const std::size_t requested = options.capacity_bytes != 0
-                                    ? options.capacity_bytes
-                                    : HostSnapshotBudgetBytes();
-  return std::min(requested, HostSnapshotCeilingBytes());
+  return options.capacity_bytes != 0 ? options.capacity_bytes
+                                     : HostSnapshotBudgetBytes();
 }
 
 using Clock = std::chrono::steady_clock;
@@ -4317,6 +4318,7 @@ public:
         // reserve its remaining lazy buffers once from aggregate capacity.
         .temporary_scratch_bytes = 0,
         .retained_snapshot_capacity_bytes = HostSnapshotBudgetBytes(),
+        .retained_snapshot_ceiling_bytes = HostSnapshotCeilingBytes(),
         .requires_device_runtime_lock = true,
     };
   }
