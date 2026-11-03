@@ -30,12 +30,12 @@ sudo apt install build-essential cmake ninja-build pkg-config \
   libavutil-dev libswscale-dev ffmpeg libibverbs-dev \
   hipblas-dev hipblaslt-dev rocblas-dev hipcub-dev rocprim-dev rocwmma-dev
 
-cmake --preset release -DGUFO_ENABLE_TP2_RDMA=ON
+cmake --preset release -DGUFO_ENABLE_TP2_RDMA=ON -DGUFO_MIMO2_HIP=ON
 cmake --build --preset release --parallel 8
 ./build/release/gufo diagnose
 ```
 
-The measured build used ROCm 7.2.4 at `/opt/rocm-7.2.4`.
+Both flags are required: `GUFO_MIMO2_HIP` defaults to OFF, and without it the link fails on every `mimo2` symbol. The measured build used ROCm 7.2.4 at `/opt/rocm-7.2.4`.
 
 ## Model files
 
