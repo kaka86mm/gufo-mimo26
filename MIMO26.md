@@ -20,6 +20,9 @@ The USB4 write-striping transport is
   `ac82b1ae`), built as `RelWithDebInfo` with ROCm 7.2.4 on gfx1151.
 - A rebuild in a different directory is not byte-identical (debug paths are
   embedded). The source tree is the tree the measured binary was built from.
+- Verified from a clean clone of this tag: the two flags above build a
+  303,327,840-byte `gufo` that runs (`gufo --version`); its md5 differs only
+  because the build directory is embedded in `RelWithDebInfo`.
 
 Build:
 
