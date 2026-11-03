@@ -399,7 +399,7 @@ struct Uploader {
 /// Replaces the dense attention projections, the lm head, the MTP draft
 /// network's own dense tensors and (when the sidecar carries them) the routed
 /// expert tensors with a requantized sidecar's copies -- see
-/// ops/mimo2_requant_dense.py. The sidecar repeats each tensor's name and
+/// tools/mimo2_requant_dense.py. The sidecar repeats each tensor's name and
 /// logical shape at a smaller type (Q4_0/Q4_K), cutting the bytes those
 /// tensors cost per token (and per draft pass) roughly in half; every
 /// consumer stays untouched because the uploader and the TP row splits

@@ -1,5 +1,8 @@
 # Gufo: The ***Open Source*** Strix Halo AI engine 
 
+> **MiMo-V2.6-Flash-RL port:** this fork adds the `mimo2` model and its TP2
+> serving path. See [MIMO26.md](MIMO26.md).
+
 <p align="center">
   <img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180"><img src="assets/gufo-logo.jpg" alt="Gufo logo" width="180">
 </p>

@@ -231,7 +231,7 @@ std::shared_ptr<Model> Model::Load(const std::string& model_path,
     }
     m->mtp_weights_ = std::make_unique<MtpWeights>(std::move(*mtp));
   }
-  // Dense-projection requantization (ops/mimo2_requant_dense.py): the sidecar
+  // Dense-projection requantization (tools/mimo2_requant_dense.py): the sidecar
   // carries the attention projections (and layer 0's dense FFN) at a 4-bit
   // type, roughly halving the per-token dense bytes.
   if (const char* dense_sc = std::getenv("GUFO_MIMO_DENSE_SC");

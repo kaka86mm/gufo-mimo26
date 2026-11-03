@@ -95,7 +95,7 @@ public:
   /// Streams tensors from the same open files used to bind their metadata.
   /// `mtp`/`mtp_reader` carry the sidecar's own shard table. `dense_sidecar`
   /// (optional) replaces the attention projections with a requantized copy
-  /// (ops/mimo2_requant_dense.py); see GraftDenseSidecar.
+  /// (tools/mimo2_requant_dense.py); see GraftDenseSidecar.
   [[nodiscard]] static std::unique_ptr<DeviceModel> Upload(
       const ModelWeights& weights, const core::GgufReader& reader,
       const MtpWeights* mtp, const core::GgufReader* mtp_reader,
