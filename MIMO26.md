@@ -107,6 +107,8 @@ gufo serve llm --model <shard1> --speculative mtp --mtp-model <mtp> \
 ```
 
 Rank 0 listens for the peer; rank 1 passes `--tp-bootstrap-host <rank0-ip>`.
+`--cache-disk` must be a real directory owned by the engine user; a symlink is
+rejected with `continuation disk directory is not a private owned directory`.
 
 Graph capture is deliberately off: measured −40%, because replay kernels are
 slower than eager on this workload. The EXL3 sources under
